@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local environment overrides
+.env
+.env.*
+!.env.example
+
+# Coverage / profiling
+*.profraw
+*.profdata
+tarpaulin-report.*

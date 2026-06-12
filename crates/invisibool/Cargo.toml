@@ -1,0 +1,19 @@
+[package]
+name = "invisibool"
+description = "Invisibool CLI: local, privacy-first secrets and PII scrubber for LLM prompts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "invisibool"
+path = "src/main.rs"
+
+[dependencies]
+invisibool-engine = { path = "../invisibool-engine" }
+
+[lints]
+workspace = true
