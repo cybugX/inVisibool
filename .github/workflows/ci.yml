@@ -1,0 +1,203 @@
+# Continuous integration for Invisibool.
+#
+# Build-prompt §4 mandates: build, test, clippy -D warnings, fmt --check,
+# cargo deny, cargo audit, the leak harness, Criterion (informational +
+# regression tripwire per §3.3), and gitleaks — on every PR.
+#
+# Tool versions are pinned identically to Dockerfile.dev so CI and the
+# local-Docker dev environment use the same binaries. Each SHA-256 is
+# verified at runtime; an upstream re-tag cannot silently swap a binary.
+# When bumping any pin, update Dockerfile.dev and this workflow in the
+# same commit.
+#
+# Each gate is its own job so the GitHub PR status page shows each
+# independently; CI minutes for parallel small jobs are fungible. The
+# leak-harness and bench-regression jobs are M0a placeholders — build-
+# prompt §5 M0a explicitly allows failing/empty jobs only where the code
+# they would gate does not yet exist; M0b fills them.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  # Cancel in-progress PR builds when new commits land; never cancel main.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ----- formatting --------------------------------------------------------
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ----- build + test ------------------------------------------------------
+  check-test:
+    name: cargo check + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace --all-targets
+
+  # ----- clippy ------------------------------------------------------------
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ----- cargo-deny --------------------------------------------------------
+  deny:
+    name: cargo deny check
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_DENY_VERSION: 0.19.8
+      CARGO_DENY_SHA256: 70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install pinned cargo-deny
+        run: |
+          set -euo pipefail
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL "$url" -o /tmp/cargo-deny.tar.gz
+          echo "${CARGO_DENY_SHA256}  /tmp/cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/cargo-deny.tar.gz -C /tmp
+          install -m 0755 "/tmp/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny" /usr/local/bin/cargo-deny
+          cargo-deny --version
+      - run: cargo deny check
+
+  # ----- cargo-audit -------------------------------------------------------
+  #
+  # On the M0a dep-free scaffold this job is STRUCTURAL: cargo-audit fetches
+  # the RustSec advisory DB over the network and then has zero non-workspace
+  # crates to audit, so it exits clean trivially. The CI slot exists now so
+  # M0b/M1 (which bring in real deps) start auditing immediately with no
+  # workflow change. Treat an empty-result first push as expected, not a
+  # mystery success.
+  audit:
+    name: "cargo audit (M0a: dep-free, structural)"
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_AUDIT_VERSION: 0.22.2
+      # Trust-on-first-use: rustsec publishes no .sha256 file alongside the
+      # asset (see Dockerfile.dev annotation). Re-verify when bumping.
+      CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: M0a context
+        run: |
+          cat <<'EOF'
+          cargo audit on the M0a scaffold: the workspace has no third-party
+          dependencies yet, so cargo-audit will fetch the RustSec advisory DB
+          and then find nothing to scan. That clean exit is structural and
+          expected. M0b adds the first real deps (aho-corasick, regex, fpe,
+          aes-gcm, argon2, secrecy, zeroize, ...) and from that point on
+          cargo audit becomes meaningful without any workflow change.
+
+          Tool is networked (advisory DB clone over HTTPS); the engine and
+          vault crate paths themselves remain network-free per the
+          non-negotiables. cargo-audit only ever runs in CI/dev tooling.
+          EOF
+      - name: Install pinned cargo-audit
+        run: |
+          set -euo pipefail
+          url="https://github.com/rustsec/rustsec/releases/download/cargo-audit/v${CARGO_AUDIT_VERSION}/cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}.tgz"
+          curl -fsSL "$url" -o /tmp/cargo-audit.tgz
+          echo "${CARGO_AUDIT_SHA256}  /tmp/cargo-audit.tgz" | sha256sum -c -
+          tar -xzf /tmp/cargo-audit.tgz -C /tmp
+          install -m 0755 "/tmp/cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}/cargo-audit" /usr/local/bin/cargo-audit
+          cargo-audit --version
+      - run: cargo audit
+
+  # ----- gitleaks ----------------------------------------------------------
+  gitleaks:
+    name: gitleaks detect
+    runs-on: ubuntu-24.04
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # gitleaks scans git history; the default shallow checkout would
+          # only see the most recent commit. fetch-depth: 0 pulls full
+          # history so leaks introduced in any prior commit are caught too.
+          fetch-depth: 0
+      - name: Install pinned gitleaks
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL "$url" -o /tmp/gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp
+          install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - run: gitleaks detect --no-banner --redact --source .
+
+  # ----- leak harness (M0a placeholder) ------------------------------------
+  leak-harness:
+    name: leak harness (M0a placeholder)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Placeholder
+        run: |
+          cat <<'EOF'
+          Leak harness placeholder — M0b will add the real integration harness.
+
+          Per build-prompt §3.1: canary plaintext may appear ONLY on restore's
+          intended primary output channel (stdout, or the clipboard slot for an
+          explicit clipboard restore) — never in logs, temp files, audit output,
+          stray clipboard writes, or control-channel traffic. Canary secrets are
+          generated at runtime by the harness, never committed.
+
+          M0a is a scaffold with no engine code; there is nothing to leak yet,
+          so this job is a structural pass. The CI slot exists now so M0b adds
+          only the harness code, not the workflow wiring.
+          EOF
+
+  # ----- Criterion bench regression (M0a placeholder) ----------------------
+  bench-regression:
+    name: bench regression (M0a placeholder)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Placeholder
+        run: |
+          cat <<'EOF'
+          Criterion bench placeholder — M0b will add benches over the committed corpus.
+
+          Per build-prompt §3.3: benches run INFORMATIONALLY (numbers reported,
+          never absolute wall-clock hard-fails — shared runners are too noisy).
+          A separate regression tripwire fails ONLY on a large slowdown (>2×)
+          vs. a committed baseline, where the baseline is generated by a CI job
+          on THIS runner class and committed from that job's artifact — never
+          measured on a dev machine.
+
+          The committed benchmark corpus (2 KB prose prompt with 3 secrets,
+          64 KB source file, 1 MB log) arrives with M0b. The CI slot exists
+          now so M0b adds only the benches, not the workflow wiring.
+          EOF
