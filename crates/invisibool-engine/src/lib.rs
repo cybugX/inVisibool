@@ -7,4 +7,5 @@
 #![forbid(unsafe_code)]
 
 pub mod detection;
+pub mod idempotence;
 pub mod tokenizer;
