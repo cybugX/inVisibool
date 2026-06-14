@@ -36,84 +36,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
+use super::alphabet::Alphabet;
+
 type HmacSha256 = Hmac<Sha256>;
-
-/// A character set used to encode a MAC tail. Must be ASCII-only and
-/// must not contain repeated characters; both invariants are met by the
-/// constants below and assumed by `mac_tail` / `verify`.
-#[derive(Copy, Clone, Debug)]
-pub struct Alphabet {
-    chars: &'static str,
-}
-
-impl Alphabet {
-    /// `0-9 A-Z a-z` — radix 62.
-    pub const BASE62: Self = Self {
-        chars: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
-    };
-    /// RFC 4648 base32: `A-Z 2-7` — radix 32 (also the AWS access-key
-    /// alphabet after the AKIA prefix).
-    pub const BASE32: Self = Self {
-        chars: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
-    };
-    /// `0-9 a-f` — radix 16.
-    pub const HEX_LOWER: Self = Self {
-        chars: "0123456789abcdef",
-    };
-    /// `0-9 A-F` — radix 16.
-    pub const HEX_UPPER: Self = Self {
-        chars: "0123456789ABCDEF",
-    };
-    /// `0-9` — radix 10.
-    pub const DIGITS: Self = Self {
-        chars: "0123456789",
-    };
-    /// `a-z` — radix 26.
-    pub const ALPHA_LOWER: Self = Self {
-        chars: "abcdefghijklmnopqrstuvwxyz",
-    };
-    /// `A-Z` — radix 26.
-    pub const ALPHA_UPPER: Self = Self {
-        chars: "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    };
-    /// `0-9 a-z` — radix 36.
-    pub const BASE36_LOWER: Self = Self {
-        chars: "0123456789abcdefghijklmnopqrstuvwxyz",
-    };
-
-    /// Build a custom alphabet. The argument must be a string of
-    /// distinct ASCII characters; both invariants are assumed by
-    /// `mac_tail` and `verify` and are not validated here.
-    pub const fn custom(chars: &'static str) -> Self {
-        Self { chars }
-    }
-
-    /// Number of symbols in this alphabet (the radix).
-    pub fn radix(&self) -> u32 {
-        // ASCII-only: `len()` in bytes equals char count.
-        u32::try_from(self.chars.len()).expect("alphabet size fits in u32")
-    }
-
-    /// K — the number of tail characters needed for at least 32 bits
-    /// of MAC entropy. Equal to `ceil(32 / log2(radix))`.
-    pub fn mac_tail_len(&self) -> usize {
-        let bits_per_char = f64::from(self.radix()).log2();
-        (32.0 / bits_per_char).ceil() as usize
-    }
-
-    /// True iff `c` is a symbol of this alphabet.
-    pub fn contains(&self, c: char) -> bool {
-        self.chars.contains(c)
-    }
-
-    fn symbol_at(&self, index: u32) -> char {
-        self.chars
-            .as_bytes()
-            .get(index as usize)
-            .map(|b| char::from(*b))
-            .expect("index < radix by construction")
-    }
-}
 
 /// Compute the K-character MAC tail for `body` under `key`. The tail
 /// consists of symbols from `alphabet`; its length is
