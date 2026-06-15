@@ -2,9 +2,9 @@
 //!
 //! Produces the three fixture files exercised by `benches/scrub.rs`:
 //!
-//!   benches/fixtures/prose_2kb.txt    — ~2 KB English prose with 3 secrets
-//!   benches/fixtures/source_64kb.rs   — ~64 KB synthetic Rust source (no secrets)
-//!   benches/fixtures/log_1mb.log      — ~1 MB synthetic access log (no secrets)
+//!   tests/fixtures/prose_2kb.txt    — ~2 KB English prose with 3 secrets
+//!   tests/fixtures/source_64kb.rs   — ~64 KB synthetic Rust source (no secrets)
+//!   tests/fixtures/log_1mb.log      — ~1 MB synthetic access log (no secrets)
 //!
 //! All three are written by a fixed-output procedure with no randomness, so
 //! re-running this example after any source change reproduces the exact
@@ -28,10 +28,12 @@ use std::path::{Path, PathBuf};
 
 fn fixtures_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR points at crates/invisibool-engine/ when run via
-    // `cargo run --example` against this crate.
+    // `cargo run --example` against this crate. The corpus lives under
+    // `tests/fixtures/` so the repo-wide secret-scanner allowlist can
+    // be narrowly path-scoped to exactly one directory.
     let manifest = std::env::var("CARGO_MANIFEST_DIR")
         .expect("cargo sets CARGO_MANIFEST_DIR for example binaries");
-    Path::new(&manifest).join("benches").join("fixtures")
+    Path::new(&manifest).join("tests").join("fixtures")
 }
 
 fn write_file(path: &Path, bytes: &[u8]) {

@@ -32,6 +32,7 @@
 //! on any candidate that contains non-ASCII bytes — Invisibool never
 //! emits non-ASCII fakes, so a non-ASCII candidate cannot be ours.
 
+use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -101,6 +102,60 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
     out
+}
+
+/// Produce a length-matched MAC-tagged fake for `real_value`.
+///
+/// Layout of the output: `body || tail`, where the body is `N - K`
+/// alphabet symbols deterministically derived from
+/// `HKDF-SHA256(salt = empty, ikm = key, info = real_value.as_bytes())`
+/// and the tail is `K` symbols equal to `mac_tail(key, body, alphabet)`.
+/// `N` is `real_value.len()` and `K` is `alphabet.mac_tail_len()`.
+///
+/// The deterministic body derivation makes the same `(key, real_value)`
+/// produce the same fake every call, so a session map keyed on `real`
+/// can short-circuit re-scrubs without re-running this generator. It
+/// also makes the fake reproducible by tests and by an M1 daemon that
+/// rebuilds its session map after an idle-lock wake.
+///
+/// Returns `None` when `real_value.len() <= K`: the short-fake carve-out
+/// documented at the module level. With no room for at least one body
+/// character before the K-character MAC tail, the fake would be either
+/// the empty body's MAC (degenerate, not meaningful as a fake) or simply
+/// too short to verify back through `verify`. The engine routes these
+/// values to its fail-closed redaction path instead.
+pub fn make_macfake(key: &[u8], real_value: &str, alphabet: &Alphabet) -> Option<String> {
+    let k = alphabet.mac_tail_len();
+    let n = real_value.len();
+    if n <= k {
+        return None;
+    }
+    let body_len = n - k;
+    let body = derive_body(key, real_value, body_len, alphabet);
+    let tail = mac_tail(key, body.as_bytes(), alphabet);
+    Some(format!("{body}{tail}"))
+}
+
+/// Derive `body_len` alphabet symbols pseudorandomly from `(key, real_value)`.
+///
+/// Uses HKDF-SHA256 to produce `body_len` bytes (HKDF's 255 * HashLen
+/// ceiling is 8160 bytes for SHA-256, far above any realistic Formatless
+/// value length). Each byte is mapped into the alphabet by modulus.
+///
+/// Modulo bias note: a single byte mapped `b % radix` is slightly
+/// non-uniform when the radix does not divide 256. The bias is at most
+/// `radix / 256` and is acceptable here — the body is plausibility
+/// padding around an authoritative MAC tail, not cryptographic output.
+/// FF1 uses a separate, properly bias-free numeral path.
+fn derive_body(key: &[u8], real_value: &str, body_len: usize, alphabet: &Alphabet) -> String {
+    let hkdf = Hkdf::<Sha256>::new(None, key);
+    let mut out = vec![0u8; body_len];
+    hkdf.expand(real_value.as_bytes(), &mut out)
+        .expect("body_len fits in HKDF-SHA256's 255*32 byte ceiling for any realistic value");
+    let radix = alphabet.radix();
+    out.into_iter()
+        .map(|b| alphabet.symbol_at(u32::from(b) % radix))
+        .collect()
 }
 
 fn encode_to_alphabet(mac_bytes: &[u8], alphabet: &Alphabet) -> String {
@@ -334,6 +389,94 @@ mod tests {
                 "round-trip failed for radix {}",
                 ab.radix()
             );
+        }
+    }
+
+    // ----- make_macfake -----
+
+    #[test]
+    fn make_macfake_matches_real_value_length() {
+        let real = "p@$$w0rd!-with-22-chars";
+        let fake = make_macfake(TEST_KEY, real, &Alphabet::BASE62).expect("long enough");
+        assert_eq!(fake.len(), real.len());
+    }
+
+    #[test]
+    fn make_macfake_output_verifies_under_same_key() {
+        // Round-trip: a freshly-generated fake recognises itself via
+        // the same verify path the idempotence layer uses.
+        let real = "ABCDEFGHIJ";
+        let fake = make_macfake(TEST_KEY, real, &Alphabet::BASE62).expect("long enough");
+        assert!(verify(TEST_KEY, &fake, &Alphabet::BASE62));
+    }
+
+    #[test]
+    fn make_macfake_does_not_contain_the_real_value() {
+        // Defence in depth: the fake's body is derived from HKDF over
+        // the real value, but the output bytes must not contain the
+        // real value as a substring. This pins the "no plaintext
+        // smuggling" invariant.
+        let real = "exfiltrate-this-string";
+        let fake = make_macfake(TEST_KEY, real, &Alphabet::BASE62).expect("long enough");
+        assert!(
+            !fake.contains(real),
+            "MAC-fake contained the real value: fake={fake} real={real}"
+        );
+    }
+
+    #[test]
+    fn make_macfake_is_deterministic_in_key_and_real() {
+        let real = "deterministic-input";
+        let a = make_macfake(TEST_KEY, real, &Alphabet::BASE62).unwrap();
+        let b = make_macfake(TEST_KEY, real, &Alphabet::BASE62).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn make_macfake_distinct_reals_yield_distinct_fakes() {
+        let a = make_macfake(TEST_KEY, "real-value-AAAA", &Alphabet::BASE62).unwrap();
+        let b = make_macfake(TEST_KEY, "real-value-BBBB", &Alphabet::BASE62).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn make_macfake_distinct_keys_yield_distinct_fakes() {
+        let real = "same-input-string";
+        let a = make_macfake(b"key-A", real, &Alphabet::BASE62).unwrap();
+        let b = make_macfake(b"key-B", real, &Alphabet::BASE62).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn make_macfake_short_carve_out_returns_none() {
+        // BASE62 K = 6. Any real value of length <= 6 has no room for a
+        // body before the tail; the carve-out fires.
+        assert!(make_macfake(TEST_KEY, "", &Alphabet::BASE62).is_none());
+        assert!(make_macfake(TEST_KEY, "abc", &Alphabet::BASE62).is_none());
+        assert!(make_macfake(TEST_KEY, "abcdef", &Alphabet::BASE62).is_none());
+        // K + 1 = 7: the smallest length that fits one body char + tail.
+        assert!(make_macfake(TEST_KEY, "abcdefg", &Alphabet::BASE62).is_some());
+    }
+
+    #[test]
+    fn make_macfake_body_is_in_alphabet() {
+        // Every output character must be an alphabet symbol, so a
+        // subsequent verify round-trip cannot be defeated by stray
+        // non-alphabet bytes in the body.
+        let real = "longer-real-value-here";
+        for ab in [
+            Alphabet::BASE62,
+            Alphabet::HEX_LOWER,
+            Alphabet::DIGITS,
+            Alphabet::BASE32,
+        ] {
+            let fake = make_macfake(TEST_KEY, real, &ab).unwrap();
+            assert!(
+                fake.chars().all(|c| ab.contains(c)),
+                "MAC-fake {fake} contains a char outside the alphabet (radix {})",
+                ab.radix()
+            );
+            assert!(verify(TEST_KEY, &fake, &ab));
         }
     }
 }

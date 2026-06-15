@@ -21,11 +21,14 @@ useDefault = true
 
 [allowlist]
 description = """
-Narrow allowlist: test fixtures under tests/fixtures/ and the regex \
-source of the detection ruleset at rules/secrets.toml. Nothing else is \
-exempted from gitleaks scanning.\
+Narrow allowlist: the engine's bench corpus under \
+crates/invisibool-engine/tests/fixtures/ (synthetic inv-EXAMPLE- tokens \
++ no-secret corpus files) and the regex source of the detection \
+ruleset at rules/secrets.toml. A future crate that needs its own \
+fixtures directory must add its own entry here — never broaden this \
+into a tests/fixtures/.* wildcard that would silently cover new dirs.\
 """
 paths = [
-    '''tests/fixtures/.*''',
+    '''crates/invisibool-engine/tests/fixtures/.*''',
     '''rules/secrets\.toml''',
 ]

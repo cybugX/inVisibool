@@ -27,16 +27,29 @@
 //!   must not survive.
 //!
 //! Fail-closed paths — the leak class this harness exists to catch.
-//! Each of the three branches replaces the canary with
-//! `REDACTION_PLACEHOLDER` and emits a typed notice; the harness pins
-//! both the leak-contract and the notice-shape:
+//! Each branch must keep the canary out of every channel; the
+//! Formatless branch additionally splits by length:
 //!
-//! - Formatless registration → `ScrubNotice::RedactedFormatless`.
+//! - Formatless long-body (`> K` chars) — engine emits a MAC-tagged
+//!   fake of matching length. Test asserts both the leak-contract AND
+//!   that the emitted fake verifies under the session MAC key (so the
+//!   idempotence layer recognises it on re-scrub).
+//! - Formatless short-body (`<= K` chars, the carve-out) — engine emits
+//!   `REDACTION_PLACEHOLDER` + `ScrubNotice::RedactedFormatless`.
 //! - FF1 eligibility re-check failure at scrub time (corrupt or
-//!   migrated vault entry) → `ScrubNotice::RedactedInternalFailure`.
+//!   migrated vault entry) → `REDACTION_PLACEHOLDER` +
+//!   `ScrubNotice::RedactedInternalFailure`.
 //! - Session-mapped Card whose layout the `fake_card_visa16` generator
 //!   does not understand (e.g. an Amex 15-digit registration) →
-//!   `ScrubNotice::RedactedInternalFailure`.
+//!   `REDACTION_PLACEHOLDER` + `ScrubNotice::RedactedInternalFailure`.
+//!
+//! Session-mode round-trip:
+//!
+//! - `scrub_with_session` → `restore_with_session` for a long-body
+//!   Formatless canary. The scrub-half assertions are unchanged from
+//!   the leak-contract (canary absent from every scrub channel); the
+//!   restore-half intentionally violates the contract (the canary IS
+//!   expected back — that's the entire purpose of restore).
 //!
 //! Each test runs `ROUNDS` times with independent canaries so a one-in-
 //! a-bunch lucky alignment cannot mask a leak.
@@ -344,33 +357,146 @@ fn card_path_does_not_leak() {
 // shape (placeholder present + the expected notice variant fired).
 
 #[test]
-fn formatless_path_redacts_and_does_not_leak() {
+fn formatless_short_body_carveout_redacts_and_does_not_leak() {
+    // Short-fake carve-out: a 6-char Formatless body cannot carry a
+    // BASE62 MAC tail (K = 6, body needs > K), so the engine fails
+    // closed with the redaction placeholder. The leak-contract still
+    // holds — the canary must not survive in any escape channel.
     let mut state = seed();
     for round in 0..ROUNDS {
-        // A short alphabetic string is FF1-ineligible (domain too small),
-        // which is exactly the case the engine routes to Formatless and
-        // fails closed by replacing with REDACTION_PLACEHOLDER.
         let canary = lowercase_alnum(&mut state, 6);
         let input = format!("pin is {canary} keep secret");
 
         let registered = vec![RegisteredValue::SessionMapped(SessionRegistration {
-            label: format!("formatless-canary-{round}"),
+            label: format!("formatless-short-canary-{round}"),
             value: Zeroizing::new(canary.clone()),
             kind: SessionFakeKind::Formatless,
         })];
         let (engine, regs_dbg) = build_engine(registered);
 
         let scrub = engine.scrub(&input);
-        assert_no_leak_in_scrub(&canary, &scrub, &regs_dbg, "formatless", round);
+        assert_no_leak_in_scrub(&canary, &scrub, &regs_dbg, "formatless-short", round);
         assert_failclose_branch(
             &scrub,
             &canary,
             FailCloseVariant::Formatless,
-            "formatless",
+            "formatless-short",
             round,
         );
 
-        println!("leak-harness formatless round {round} OK");
+        println!("leak-harness formatless-short round {round} OK");
+    }
+}
+
+#[test]
+fn formatless_long_body_mac_fake_does_not_leak() {
+    // Long-body Formatless: the engine emits a MAC-tagged fake of
+    // matching length. The leak-contract assertions all stay live
+    // (canary absent from EVERY scrub channel), AND we add a
+    // positive assertion that the emitted fake is MAC-recognisable so
+    // the idempotence layer would catch it on re-scrub.
+    let mut state = seed();
+    let mac_key = b"leak-harness-mac-key".to_vec();
+    for round in 0..ROUNDS {
+        let body = base62_body(&mut state, 22);
+        let canary = format!("fmtl-{body}");
+        let prefix = "the formatless secret is ";
+        let suffix = " end of line";
+        let input = format!("{prefix}{canary}{suffix}");
+
+        let registered = vec![RegisteredValue::SessionMapped(SessionRegistration {
+            label: format!("formatless-long-canary-{round}"),
+            value: Zeroizing::new(canary.clone()),
+            kind: SessionFakeKind::Formatless,
+        })];
+        let (engine, regs_dbg) = build_engine(registered);
+
+        let scrub = engine.scrub(&input);
+
+        // The leak-contract — preserved verbatim from the carve-out
+        // shape so this stronger test cannot weaken the guarantee.
+        assert_no_leak_in_scrub(&canary, &scrub, &regs_dbg, "formatless-long", round);
+
+        // Positive shape: a MAC-tagged fake — NOT the placeholder —
+        // sits in the canary's place, and it verifies under the same
+        // session MAC key the engine was built with.
+        assert!(
+            !scrub.output.contains(REDACTION_PLACEHOLDER),
+            "[formatless-long #{round}] engine emitted placeholder for a long-body Formatless",
+        );
+        assert_eq!(scrub.scrubbed_count, 1);
+        let after_prefix = scrub
+            .output
+            .strip_prefix(prefix)
+            .expect("scrub output keeps surrounding prose");
+        let fake = &after_prefix[..canary.len()];
+        assert_eq!(
+            fake.len(),
+            canary.len(),
+            "fake length must match real length"
+        );
+        assert_ne!(fake, canary, "fake equals canary — no scrubbing happened");
+        assert!(
+            invisibool_engine::tokenizer::mac::verify(&mac_key, fake, &Alphabet::BASE62),
+            "[formatless-long #{round}] emitted MAC-fake does not verify under the session MAC key",
+        );
+
+        println!("leak-harness formatless-long round {round} OK");
+    }
+}
+
+#[test]
+fn formatless_mac_fake_round_trips_through_session_map() {
+    // The pre-13 contract: a MAC-fake round-trips through the in-memory
+    // session map. scrub_with_session emits the fake AND stores
+    // (real, fake); restore_with_session looks the fake up and brings
+    // the original back verbatim. The leak-contract holds during the
+    // scrub half — canary absent from every scrub channel — and is
+    // intentionally violated during the restore half (the canary IS
+    // supposed to come back, that's the entire point of restore).
+    use invisibool_engine::tokenizer::session::SessionMap;
+    use std::time::{Duration, Instant};
+
+    let mut state = seed();
+    for round in 0..ROUNDS {
+        let body = base62_body(&mut state, 22);
+        let canary = format!("rtfm-{body}");
+        let input = format!("the secret is {canary} please scrub");
+
+        let registered = vec![RegisteredValue::SessionMapped(SessionRegistration {
+            label: format!("formatless-roundtrip-canary-{round}"),
+            value: Zeroizing::new(canary.clone()),
+            kind: SessionFakeKind::Formatless,
+        })];
+        let (engine, regs_dbg) = build_engine(registered);
+
+        let mut session = SessionMap::new(64, Duration::from_secs(600));
+        let t0 = Instant::now();
+        let scrub = engine.scrub_with_session(&input, &mut session, t0);
+
+        // Scrub half: every leak-channel check must still pass.
+        assert_no_leak_in_scrub(&canary, &scrub, &regs_dbg, "formatless-rt", round);
+        assert!(
+            !scrub.output.contains(REDACTION_PLACEHOLDER),
+            "[formatless-rt #{round}] session-mode scrub emitted the placeholder",
+        );
+        assert!(
+            scrub.notices.is_empty(),
+            "[formatless-rt #{round}] session-mode scrub emitted unrestorable-notice for a restorable fake",
+        );
+        assert_eq!(session.len(), 1);
+
+        // Restore half: the canary IS expected to appear here. This is
+        // the one channel the leak-contract carves out by design.
+        let restored =
+            engine.restore_with_session(&scrub.output, &mut session, t0 + Duration::from_secs(1));
+        assert_eq!(
+            restored.output, input,
+            "[formatless-rt #{round}] session-mode restore did not round-trip"
+        );
+        assert_eq!(restored.restored_count, 1);
+
+        println!("leak-harness formatless-rt round {round} OK");
     }
 }
 

@@ -12,12 +12,14 @@
 //!   — output is restorable in long-lived processes via the session
 //!   map, but *not* in two-command terminal mode.
 //! - **Cards** go through `fake_card_visa16` — same restorability story.
-//! - **Formatless** values would need a random+MAC body generator on
-//!   top of the MAC-tag primitives, which M0b does not yet wire here.
-//!   Until that lands, the engine FAILS CLOSED: the original value is
-//!   removed from the output and replaced with `REDACTION_PLACEHOLDER`,
-//!   and a `RedactedFormatless` notice is recorded. Better to drop the
-//!   secret than to let it pass through.
+//! - **Formatless** values get a MAC-tagged fake of matching length —
+//!   `mac::make_macfake` derives a deterministic body from
+//!   `HKDF(session_mac_key, real)` and appends a `K`-character MAC
+//!   tail so the idempotence layer can recognise the fake on re-scrub.
+//!   Short-fake carve-out: if the registered value is too short to
+//!   carry a MAC tail (`len <= K`), the engine FAILS CLOSED — the
+//!   original is removed and replaced with `REDACTION_PLACEHOLDER`
+//!   and a `RedactedFormatless` notice is recorded.
 //!
 //! ## Fail-closed contract
 //!
@@ -46,13 +48,18 @@
 //! engine already; M1's `watch` daemon and the CLI's `--session` flag
 //! wire it into a live restore path.
 
+use std::time::Instant;
+
 use crate::detection::{ExactMatcher, MatchKind};
 use crate::idempotence::{IdempotenceContext, IdempotenceDecision};
+use crate::tokenizer::alphabet::Alphabet;
 use crate::tokenizer::fpe::{
     FpeRegistration, FpeTokenizer, KeyProvider, PiiKind, RegisteredValue, SessionFakeKind,
     SessionRegistration,
 };
+use crate::tokenizer::mac;
 use crate::tokenizer::reserved::{fake_card_visa16, fake_email, fake_ipv4, fake_phone};
+use crate::tokenizer::session::SessionMap;
 
 /// The engine. Owns the registered vault snapshot, the FF1 tokenizer,
 /// and a precompiled exact-match automaton.
@@ -73,6 +80,39 @@ pub struct Engine {
 enum RegistrationRef {
     Fpe(usize),
     Session(usize),
+}
+
+/// Internal scrub-mode switch: either keep the engine stateless (default,
+/// the `Engine::scrub` entry point) or thread a caller-owned session map
+/// through so each generated session-mapped fake is stored for in-process
+/// restore (the `Engine::scrub_with_session` entry point).
+enum SessionStore<'a> {
+    None,
+    Map {
+        session: &'a mut SessionMap,
+        now: Instant,
+    },
+}
+
+impl SessionStore<'_> {
+    /// Persist a `(real, fake)` pair if a session map is attached.
+    /// Returns true iff the pair was stored.
+    fn store(&mut self, real: &str, fake: &str) -> bool {
+        match self {
+            SessionStore::None => false,
+            SessionStore::Map { session, now } => {
+                // `get_or_insert` is the simplest stable API on the
+                // session map — for a fresh real value it inserts the
+                // pair via the closure; for a repeat it returns the
+                // existing fake (which equals the one we just generated
+                // because all our session-fake generators are
+                // deterministic in `real`).
+                let fake_owned = fake.to_string();
+                let _ = session.get_or_insert(real, *now, || fake_owned);
+                true
+            }
+        }
+    }
 }
 
 /// Errors building an `Engine`.
@@ -212,7 +252,35 @@ impl Engine {
 
     /// Scrub the input. Walks the exact-match hits left to right,
     /// runs idempotence on each, and dispatches by registration kind.
+    ///
+    /// Stateless mode: session-mapped fakes (PII, Card, Formatless) are
+    /// emitted with a `SessionMappedUnrestorable` notice — the user is
+    /// told the fake cannot be restored without a long-lived session.
+    /// For an in-process session-mapped round-trip, use
+    /// [`Engine::scrub_with_session`] instead.
     pub fn scrub(&self, input: &str) -> EngineScrubResult {
+        self.scrub_impl(input, SessionStore::None)
+    }
+
+    /// Scrub the input AND store each session-mapped `(real, fake)`
+    /// pair in `session` so a later [`Engine::restore_with_session`]
+    /// call can recover the original. In this mode the
+    /// `SessionMappedUnrestorable` notice is suppressed — the fake IS
+    /// restorable in-process through `session`.
+    ///
+    /// `now` is the timestamp handed to the session map's LRU/TTL
+    /// bookkeeping. Production callers pass `Instant::now()`; tests
+    /// construct successive `Instant`s by adding `Duration`s to a base.
+    pub fn scrub_with_session(
+        &self,
+        input: &str,
+        session: &mut SessionMap,
+        now: Instant,
+    ) -> EngineScrubResult {
+        self.scrub_impl(input, SessionStore::Map { session, now })
+    }
+
+    fn scrub_impl(&self, input: &str, mut store: SessionStore<'_>) -> EngineScrubResult {
         let mut output = String::with_capacity(input.len());
         let mut notices: Vec<ScrubNotice> = Vec::new();
         let mut scrubbed_count = 0;
@@ -285,21 +353,33 @@ impl Engine {
                             session_reg.value.as_bytes(),
                             session_reg.value.as_str(),
                         ),
-                        SessionFakeKind::Formatless => None,
+                        SessionFakeKind::Formatless => mac::make_macfake(
+                            &self.session_mac_key,
+                            session_reg.value.as_str(),
+                            &Alphabet::BASE62,
+                        ),
                     };
                     match (fake, session_reg.kind) {
                         (Some(fake), _) => {
                             output.push_str(&fake);
                             scrubbed_count += 1;
-                            notices.push(ScrubNotice::SessionMappedUnrestorable {
-                                label: session_reg.label.clone(),
-                                kind: session_reg.kind,
-                            });
+                            let stored = store.store(session_reg.value.as_str(), &fake);
+                            if !stored {
+                                // Stateless mode: the user must know
+                                // this fake will not restore without a
+                                // session.
+                                notices.push(ScrubNotice::SessionMappedUnrestorable {
+                                    label: session_reg.label.clone(),
+                                    kind: session_reg.kind,
+                                });
+                            }
                         }
                         (None, SessionFakeKind::Formatless) => {
-                            // Fail CLOSED: M0b has no random+MAC body
-                            // generator wired here. Redact rather than
-                            // leave the original.
+                            // Fail CLOSED on the short-fake carve-out:
+                            // a Formatless value of length <= K cannot
+                            // carry a MAC tail, so `make_macfake` returned
+                            // None. Redact rather than emit a fake the
+                            // idempotence layer cannot recognise.
                             output.push_str(REDACTION_PLACEHOLDER);
                             scrubbed_count += 1;
                             notices.push(ScrubNotice::RedactedFormatless {
@@ -395,6 +475,60 @@ impl Engine {
         EngineRestoreResult {
             output,
             restored_count,
+        }
+    }
+
+    /// Restore in session-mapped mode: first replace every session-stored
+    /// fake with its registered real value, then run the stateless FF1
+    /// restore pass over the result. Each session lookup touches the
+    /// entry's `last_touched` timestamp so frequently-restored pairs
+    /// keep their LRU/TTL standing.
+    ///
+    /// `now` is the timestamp handed to the session map's LRU/TTL
+    /// bookkeeping (see `scrub_with_session`'s contract).
+    ///
+    /// The two passes compose cleanly because the FF1 fake space and the
+    /// session-stored fake space do not overlap: an FF1 fake matches a
+    /// known prefix + alphabet + length profile, and session-stored
+    /// fakes never sit inside an FF1 registration's profile by
+    /// construction.
+    pub fn restore_with_session(
+        &self,
+        input: &str,
+        session: &mut SessionMap,
+        now: Instant,
+    ) -> EngineRestoreResult {
+        // First pass: session-map restoration. Collect candidates that
+        // appear in the input before mutating the map so we don't hold
+        // an iterator borrow while calling `restore`.
+        let candidate_fakes: Vec<String> = session
+            .entries()
+            .filter_map(|(fake, _real)| {
+                if input.contains(fake) {
+                    Some(fake.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut working = input.to_string();
+        let mut session_restored: usize = 0;
+        for fake in candidate_fakes {
+            if let Some(real) = session.restore(&fake, now) {
+                let count = working.matches(&fake).count();
+                if count > 0 {
+                    working = working.replace(&fake, &real);
+                    session_restored += count;
+                }
+            }
+        }
+
+        // Second pass: FF1 restoration over the working text.
+        let ff1 = self.restore(&working);
+        EngineRestoreResult {
+            output: ff1.output,
+            restored_count: session_restored + ff1.restored_count,
         }
     }
 }
@@ -610,10 +744,11 @@ mod tests {
     }
 
     #[test]
-    fn formatless_redacts_rather_than_leaks() {
-        // M0b carve-out: the random+MAC generator for Formatless is not
-        // wired in the engine yet. Fail CLOSED — the original value is
-        // removed and the redaction placeholder takes its place.
+    fn formatless_short_body_carveout_redacts() {
+        // Short-fake carve-out: a Formatless value of length <= K
+        // (K = 6 for BASE62) cannot carry a MAC tail, so `make_macfake`
+        // returns None and the engine fails closed with the redaction
+        // placeholder + RedactedFormatless notice.
         let engine = Engine::new(
             &provider(),
             vec![RegisteredValue::SessionMapped(SessionRegistration {
@@ -644,6 +779,66 @@ mod tests {
                 .any(|n| matches!(n, ScrubNotice::RedactedFormatless { .. })),
             "expected RedactedFormatless notice, got {:?}",
             result.notices
+        );
+    }
+
+    #[test]
+    fn formatless_long_body_emits_mac_fake() {
+        // Long-body Formatless: the engine produces a MAC-tagged fake
+        // of matching length, the original is gone, and the fake
+        // round-trips through `mac::verify` so the idempotence layer
+        // would recognise it on re-scrub. The user is told this fake
+        // is unrestorable in stateless mode via SessionMappedUnrestorable.
+        let real = "thisIsALongerFormatlessValue1234567890";
+        let mac_key = b"test-mac-key".to_vec();
+        let engine = Engine::new(
+            &provider(),
+            vec![RegisteredValue::SessionMapped(SessionRegistration {
+                label: "passphrase".to_string(),
+                value: Zeroizing::new(real.to_string()),
+                kind: SessionFakeKind::Formatless,
+            })],
+            vec![],
+            mac_key.clone(),
+        )
+        .unwrap();
+        let input = format!("the passphrase is {real} please scrub");
+        let result = engine.scrub(&input);
+        assert_eq!(result.scrubbed_count, 1);
+        assert!(
+            !result.output.contains(real),
+            "Formatless real value leaked into output: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains(REDACTION_PLACEHOLDER),
+            "long Formatless emitted the placeholder instead of a MAC-fake",
+        );
+        // The emitted fake must verify under the same MAC key, proving
+        // the idempotence layer will recognise it on re-scrub.
+        let prefix = "the passphrase is ";
+        let after_prefix = result
+            .output
+            .strip_prefix(prefix)
+            .expect("scrub output keeps the surrounding prose");
+        let fake = &after_prefix[..real.len()];
+        assert_eq!(fake.len(), real.len(), "fake length must match real length");
+        assert!(
+            crate::tokenizer::mac::verify(&mac_key, fake, &Alphabet::BASE62),
+            "emitted Formatless fake does not verify under the session MAC key",
+        );
+        // The stateless-mode notice fires so the user knows this fake
+        // won't restore without a session map.
+        assert!(
+            result.notices.iter().any(|n| matches!(
+                n,
+                ScrubNotice::SessionMappedUnrestorable {
+                    kind: SessionFakeKind::Formatless,
+                    ..
+                }
+            )),
+            "expected SessionMappedUnrestorable(Formatless) notice, got {:?}",
+            result.notices,
         );
     }
 
@@ -728,6 +923,96 @@ mod tests {
         // end-of-scrub renderer — would break in subtle ways. Any
         // change must be deliberate and walk every consumer through.
         assert_eq!(REDACTION_PLACEHOLDER, "[INVISIBOOL_UNRESTORABLE]");
+    }
+
+    // ----- session-mode round-trip -----
+
+    #[test]
+    fn scrub_with_session_then_restore_with_session_round_trips_formatless() {
+        use crate::tokenizer::session::SessionMap;
+        use std::time::Duration;
+
+        let real = "ProductionPassphrase-not-FF1-eligible-because-contains-some-:special:-chars";
+        let engine = Engine::new(
+            &provider(),
+            vec![RegisteredValue::SessionMapped(SessionRegistration {
+                label: "passphrase".to_string(),
+                value: Zeroizing::new(real.to_string()),
+                kind: SessionFakeKind::Formatless,
+            })],
+            vec![],
+            b"test-mac-key".to_vec(),
+        )
+        .unwrap();
+        let input = format!("the passphrase is {real} please scrub it");
+
+        let mut session = SessionMap::new(64, Duration::from_secs(600));
+        let now = std::time::Instant::now();
+        let scrubbed = engine.scrub_with_session(&input, &mut session, now);
+
+        // Scrub side: original is gone, no SessionMappedUnrestorable
+        // notice (the fake IS restorable in-process through `session`).
+        assert_eq!(scrubbed.scrubbed_count, 1);
+        assert!(
+            !scrubbed.output.contains(real),
+            "real value leaked into session-mode scrub output: {}",
+            scrubbed.output,
+        );
+        assert!(
+            scrubbed.notices.is_empty(),
+            "session-mode scrub emitted notices for a restorable fake: {:?}",
+            scrubbed.notices,
+        );
+        assert_eq!(session.len(), 1, "session map did not record the fake");
+
+        // Restore side: the in-process round-trip recovers the original
+        // verbatim from the same session map.
+        let restored = engine.restore_with_session(
+            &scrubbed.output,
+            &mut session,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            restored.output, input,
+            "session-mode restore did not round-trip"
+        );
+        assert_eq!(restored.restored_count, 1);
+    }
+
+    #[test]
+    fn scrub_with_session_short_formatless_still_redacts() {
+        // Short-fake carve-out must survive into session mode: there's
+        // no MAC-tagged fake to store, so the engine emits the
+        // placeholder and a RedactedFormatless notice fires regardless
+        // of whether a session map is attached.
+        use crate::tokenizer::session::SessionMap;
+        use std::time::Duration;
+
+        let engine = Engine::new(
+            &provider(),
+            vec![RegisteredValue::SessionMapped(SessionRegistration {
+                label: "pin".to_string(),
+                value: Zeroizing::new("ABCD".to_string()),
+                kind: SessionFakeKind::Formatless,
+            })],
+            vec![],
+            b"test-mac-key".to_vec(),
+        )
+        .unwrap();
+        let mut session = SessionMap::new(64, Duration::from_secs(600));
+        let now = std::time::Instant::now();
+        let scrubbed = engine.scrub_with_session("my pin is ABCD", &mut session, now);
+        assert!(!scrubbed.output.contains("ABCD"));
+        assert!(scrubbed.output.contains(REDACTION_PLACEHOLDER));
+        assert!(scrubbed
+            .notices
+            .iter()
+            .any(|n| matches!(n, ScrubNotice::RedactedFormatless { .. })));
+        assert_eq!(
+            session.len(),
+            0,
+            "carve-out path must not poison the session map"
+        );
     }
 
     // ----- Mixed registrations + multiple occurrences -----

@@ -46,9 +46,9 @@ const PROSE_SECRETS: [&str; 3] = [
 ];
 const PROSE_PREFIX: &str = "inv-EXAMPLE-";
 
-const PROSE: &str = include_str!("fixtures/prose_2kb.txt");
-const SOURCE: &str = include_str!("fixtures/source_64kb.rs");
-const LOG: &str = include_str!("fixtures/log_1mb.log");
+const PROSE: &str = include_str!("../tests/fixtures/prose_2kb.txt");
+const SOURCE: &str = include_str!("../tests/fixtures/source_64kb.rs");
+const LOG: &str = include_str!("../tests/fixtures/log_1mb.log");
 
 fn engine_with_prose_secrets() -> Engine {
     let key_provider = InMemoryKeyProvider::new(vec![0xa5; 32]);
