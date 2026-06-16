@@ -31,7 +31,7 @@ hits it before installing.
 
 ---
 
-## Live rows (M0b)
+## Live rows (M0b and M1)
 
 ### 1. Warm exact-match automaton holds every registered value in process memory
 
@@ -423,6 +423,113 @@ target budget. We accept this - vaults that large are not the
 target use case, and a future optimisation (e.g. indexing by
 profile fingerprint) is a known follow-up if the use case
 materialises.
+
+---
+
+### 14. The vault file: real secrets at rest on the user's disk (M1)
+
+**Threat.** Until M1 the engine held no secrets at rest; the caller
+fed it a vault key as raw bytes. At M1 the vault module persists
+the registered values on disk under an AEAD encryption scheme.
+Three concrete failure modes the design has to defend against:
+the file could be tampered with (rolled back, downgraded, or
+ciphertext-flipped); a vault written under one key could be
+silently decrypted under another (compromising key separation);
+and a crash mid-write could leave a corrupted file that locks the
+user out of every secret they've ever registered.
+
+**Mitigation.**
+
+- **AEAD: XChaCha20-Poly1305** from the `chacha20poly1305` crate,
+  with a fresh 24-byte random nonce per encrypt drawn from the OS
+  CSPRNG. Collision probability for `q` writes is `q² / 2¹⁹²`,
+  which is negligible at any realistic vault write count; no
+  persistent nonce counter is needed, eliminating that whole
+  failure mode.
+- **AEAD key derivation: HKDF-SHA-256** with `salt = empty`,
+  `ikm = vault_key` (the 32-byte secret fetched from the
+  keychain), `info = "invisibool-vault-aead-v1"`. The versioned
+  info string lets a future `rotate-key` change the derivation
+  independently of the vault key. The same `vault_key` is the HKDF
+  ikm for the FF1 subkey (separate info string, so the two
+  derived keys are independent given the same input).
+- **AAD = magic + version + reserved (first 20 bytes).**
+  Tampering with any of those bytes makes Poly1305 verification
+  fail. **Version-in-AAD specifically defeats downgrade attacks:**
+  a future v2 reader cannot accept a v1 file even under the same
+  vault key, because the AAD it authenticates against (containing
+  version=2) does not match the file's bytes (containing
+  version=1).
+- **Atomic write: write-temp + fsync + rename + fsync-parent.**
+  At any crash point the on-disk state is one of two stable
+  states: the OLD vault still intact (the rename hasn't happened)
+  or the NEW vault fully durable (the rename and parent-fsync
+  succeeded). A half-written file is unreachable by construction.
+  The orphan-scan path at `Vault::open` cleans up any leftover
+  `<basename>.tmp.*` siblings from a previous crashed write. Test
+  16 (`failed_rename_leaves_old_vault_bytes_intact`) pins this
+  by sha256-comparing the on-disk bytes before and after a
+  fault-injected rename failure.
+- **File permissions: `0o600` set at create time on Unix** via
+  `OpenOptions::mode`, so no other user on a shared system can
+  read the ciphertext (already AEAD-encrypted, but
+  defense-in-depth on the filesystem boundary too). On Windows
+  the file inherits the parent dir's DACL from the per-user
+  `%LOCALAPPDATA%` hierarchy.
+- **Vault key acquisition: only via
+  `keychain::fetch_or_create`,** never raw fetch-then-store. The
+  contract enforced at the keychain trait (a real backend failure
+  returns Err, NOT Ok(None) that would trigger a generate-and-
+  overwrite) is the trust anchor for the vault key: a locked
+  keychain produces a vault-open failure, never a fresh key that
+  would orphan the existing vault contents.
+- **No hand-rolled crypto.** Every primitive is from RustCrypto:
+  `chacha20poly1305` for the AEAD, `hkdf` for the AEAD-key
+  derivation, `sha2` for the underlying hash. The vault module
+  only composes them.
+
+**Residual.**
+
+- **The plaintext is decrypted in process memory** during the
+  open-and-build-engine path. While the engine is running, the
+  registered values are heap-resident (covered by row 1 above for
+  the Aho-Corasick automaton, and by the engine's own
+  `Zeroizing<String>` wrap for each registered value). The
+  vault's encryption-at-rest does not change the in-memory
+  posture; it adds the at-rest layer.
+- **The AEAD key is also plaintext in memory** during the brief
+  window between HKDF derivation and the encrypt or decrypt call.
+  Wrapped in `Zeroizing<[u8; 32]>` so it wipes on drop, but
+  visible to a memory-dumping attacker within that window.
+- **Vault file size leaks the approximate number of registered
+  values.** The ciphertext length is the plaintext length plus
+  16 bytes (Poly1305 tag); an observer who watches the vault
+  file's size can estimate how many entries it has. Acceptable;
+  documented.
+- **`serde_json` intermediate-allocation residual.** During
+  decrypt, the JSON parser allocates intermediate `String`
+  values as it walks the plaintext bytes. Those allocations are
+  not Zeroizing-wrapped; the bytes linger in the allocator until
+  reuse. The decrypted plaintext `Vec<u8>` IS wrapped (it wipes
+  on drop), and each value is moved into a `Zeroizing<String>`
+  inside the engine's `RegisteredValue` types after parsing - so
+  the long-lived in-engine copy is wiped on eviction, but the
+  short-lived deserialization-time intermediate is not. A custom
+  Zeroizing-direct deserializer would close this; deferred to
+  M4a's vault hardening rather than landing in M1 because the
+  bytes are already heap-resident either way (row 1's residual
+  covers the broader case).
+- **macOS `F_FULLFSYNC` is not used.** Standard `fsync` on macOS
+  does not guarantee durability against unexpected power loss.
+  A power-loss within ~milliseconds of a vault write on macOS
+  may not survive. Acceptable for M1; M4a vault hardening can
+  switch to `F_FULLFSYNC` if desired.
+- **Concurrent vault writers are unsupported.** Two Invisibool
+  processes writing the same vault simultaneously could produce
+  interleaved temp files with the rename winner clobbering the
+  loser. Documented as "run one Invisibool process per user".
+  M1 watch daemon takes the single-writer position; M4a can add
+  file locking if needed.
 
 ---
 

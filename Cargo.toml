@@ -77,6 +77,24 @@ hkdf = "0.13"
 zeroize = { version = "1.9", features = ["derive"] }
 secrecy = "0.10"
 subtle = "2"
+# AEAD for the vault file at rest. The project's permitted AEAD stack
+# is `aes-gcm` or `chacha20poly1305`; the vault picks XChaCha20-Poly1305
+# (192-bit nonce, in the same `chacha20poly1305` crate as the standard
+# 96-bit ChaCha variant) so random per-encrypt nonces are collision-free
+# in practice without persisting a counter. Audit-grade: used by Signal,
+# age, libsodium. Same RustCrypto cipher 0.4 transitive as aes 0.8.
+chacha20poly1305 = "0.10"
+# Platform-appropriate vault file path: $XDG_DATA_HOME on Linux,
+# ~/Library/Application Support on macOS, %LOCALAPPDATA% on Windows.
+# Small, audited; one dep beats rolling our own 80-line cross-platform
+# path resolver with macOS/Windows known-folder edge cases.
+directories = "5"
+# OS CSPRNG for vault-key generation (handed to keychain::fetch_or_create)
+# and per-encrypt nonce generation. The vault module wraps every call in
+# a panic-on-error helper because a non-random nonce or key is
+# catastrophic; getrandom returning Err is treated as an unrecoverable
+# system failure that terminates the process.
+getrandom = "0.3"
 criterion = "0.8"
 
 [workspace.lints.rust]

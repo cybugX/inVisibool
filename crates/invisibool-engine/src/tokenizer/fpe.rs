@@ -159,7 +159,7 @@ impl std::fmt::Debug for SessionRegistration {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionFakeKind {
     /// Cards (registered or detected) always take the test-BIN path,
     /// never FF1 - the PAN domain is too small for FF1's bijection
@@ -175,7 +175,7 @@ pub enum SessionFakeKind {
     Formatless,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PiiKind {
     Email,
     Ipv4,

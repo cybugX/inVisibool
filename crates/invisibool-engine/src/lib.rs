@@ -9,6 +9,8 @@
 pub mod detection;
 pub mod engine;
 pub mod idempotence;
+pub mod keychain;
 pub mod tokenizer;
+pub mod vault;
 
 pub use engine::Engine;
