@@ -14,16 +14,41 @@
 //! under a key that the user's existing vault was NOT encrypted with -
 //! orphaning every secret in the vault.
 //!
-//! Defense in depth: a `compile_error!` below physically blocks the
-//! build if anyone ever enables `keyring/linux-native`. The mapping
-//! function [`map_keyring_error`] also routes everything-not-NoEntry
-//! to [`Mapped::Backend`], including the `#[non_exhaustive]` future
-//! catch-all, so even if a different backend ever surprised us with
-//! its own variant, the worst case is a propagated error - not a
-//! silent generate-and-overwrite. The load-bearing invariant is:
-//! `NoEntry` is the ONLY arm of the keyring error enum that maps to
-//! [`Mapped::Empty`]. The tests at the bottom of this file pin that
-//! invariant.
+//! Defense in depth has two layers, with the labour split honestly:
+//!
+//! 1. A `compile_error!` below fires at BUILD TIME for the passthrough
+//!    path: invisibool-engine declares a `linux-native` feature (see
+//!    this crate's `Cargo.toml`) that forwards to
+//!    `keyring/linux-native`, and the cfg block refuses to compile if
+//!    that feature is enabled. This catches enables that go through
+//!    our crate (`--features linux-native`, cargo feature unification
+//!    across the workspace, a downstream consumer that enables it).
+//!    It does NOT catch a direct `keyring = { features = [...,
+//!    "linux-native"] }` edit in `Cargo.toml`, because Rust's
+//!    `#[cfg(feature = "...")]` only checks the current crate's
+//!    features and cannot see transitive-crate features.
+//! 2. A `[[bans.features]]` rule in `deny.toml` denies keyring's
+//!    `linux-native`, `linux-native-sync-persistent`, and
+//!    `linux-native-async-persistent` features. CI's per-target deny
+//!    loop enforces this on every PR regardless of HOW the feature
+//!    was enabled (passthrough, direct edit, future alias). This is
+//!    the AUTHORITATIVE cross-path enforcement.
+//!
+//! The build-time `compile_error!` is a local signal; the deny ban is
+//! the guarantee. Do not let any later edit to this file claim the
+//! cfg block alone blocks keyutils - that was the original wording
+//! and was proven false at chunk 18.5 (Rust cfg cannot see transitive
+//! features; rustc itself caught it via `unexpected_cfgs`).
+//!
+//! Last-resort defence inside the mapping function itself:
+//! [`map_keyring_error`] routes everything-not-NoEntry to
+//! [`Mapped::Backend`], including the `#[non_exhaustive]` future
+//! catch-all. So even if keyutils ever made it into the binary
+//! despite both guards above, the worst case is a propagated error,
+//! not a silent generate-and-overwrite. The load-bearing invariant
+//! is: `NoEntry` is the ONLY arm of the keyring error enum that maps
+//! to [`Mapped::Empty`]. The 8 mapping tests at the bottom of this
+//! file pin that invariant.
 //!
 //! ## Testability split
 //!
@@ -134,9 +159,9 @@ pub(crate) fn map_keyring_error(err: KeyringError) -> Mapped {
         KeyringError::TooLong(attr, limit) => Mapped::Backend(format!(
             "keychain attribute '{attr}' exceeded platform length limit of {limit} chars"
         )),
-        KeyringError::Invalid(attr, reason) => Mapped::Backend(format!(
-            "invalid keychain attribute '{attr}': {reason}"
-        )),
+        KeyringError::Invalid(attr, reason) => {
+            Mapped::Backend(format!("invalid keychain attribute '{attr}': {reason}"))
+        }
         KeyringError::Ambiguous(matches) => Mapped::Backend(format!(
             "ambiguous keychain entry: {} credentials match the (service, user) pair, \
              refusing to pick one",
@@ -236,16 +261,18 @@ impl KeychainBackend for OsKeychain {
     ) -> Result<(), KeychainError> {
         let entry = entry_for(slot)?;
         let bytes: [u8; KEY_LEN] = *key.expose_secret();
-        entry.set_secret(&bytes).map_err(|e| match map_keyring_error(e) {
-            // `set_secret` returning NoEntry would be a backend
-            // surprise; surface as Backend rather than swallowing.
-            Mapped::Empty => KeychainError::Backend(
-                "keyring set_secret returned NoEntry (unexpected; the call creates \
+        entry
+            .set_secret(&bytes)
+            .map_err(|e| match map_keyring_error(e) {
+                // `set_secret` returning NoEntry would be a backend
+                // surprise; surface as Backend rather than swallowing.
+                Mapped::Empty => KeychainError::Backend(
+                    "keyring set_secret returned NoEntry (unexpected; the call creates \
                  the entry if absent)"
-                    .to_string(),
-            ),
-            Mapped::Backend(msg) => KeychainError::Backend(msg),
-        })
+                        .to_string(),
+                ),
+                Mapped::Backend(msg) => KeychainError::Backend(msg),
+            })
     }
 
     fn delete(&self, slot: &KeychainSlot) -> Result<(), KeychainError> {
@@ -296,8 +323,7 @@ mod tests {
 
     #[test]
     fn map_platform_failure_returns_backend_with_inner_text() {
-        let mapped =
-            map_keyring_error(KeyringError::PlatformFailure(boxed_io_err("dbus down")));
+        let mapped = map_keyring_error(KeyringError::PlatformFailure(boxed_io_err("dbus down")));
         match mapped {
             Mapped::Backend(msg) => assert!(
                 msg.contains("dbus down"),
@@ -350,12 +376,20 @@ mod tests {
 
     #[test]
     fn map_invalid_returns_backend_with_attribute_and_reason() {
-        let mapped =
-            map_keyring_error(KeyringError::Invalid("service".to_string(), "empty".to_string()));
+        let mapped = map_keyring_error(KeyringError::Invalid(
+            "service".to_string(),
+            "empty".to_string(),
+        ));
         match mapped {
             Mapped::Backend(msg) => {
-                assert!(msg.contains("service"), "Invalid mapping should name attribute: {msg}");
-                assert!(msg.contains("empty"), "Invalid mapping should include reason: {msg}");
+                assert!(
+                    msg.contains("service"),
+                    "Invalid mapping should name attribute: {msg}"
+                );
+                assert!(
+                    msg.contains("empty"),
+                    "Invalid mapping should include reason: {msg}"
+                );
             }
             other => panic!("Invalid must map to Backend, got {other:?}"),
         }
