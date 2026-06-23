@@ -536,6 +536,38 @@ user out of every secret they've ever registered.
   close together; closing only the write path in M1 would change
   chunk-18 code while leaving the read-path intermediate open
   for no user-facing benefit.
+- **`EngineScrubResult.output` and `EngineRestoreResult.output`
+  String allocations (chunk-20 scrub / restore engine return
+  values).** The M1 chunk-20 CLI scrub / restore handlers call
+  `Engine::scrub` / `Engine::restore` and receive an
+  `EngineScrubResult` / `EngineRestoreResult` whose `output`
+  field is a plain `String` holding, respectively, the scrubbed
+  text (no real secrets after substitution, but registered values
+  may co-exist briefly during the in-engine pass) and the
+  restored text (REAL recovered secrets - the most sensitive
+  transient in the tool). The CLI handlers re-wrap each output
+  in a `Zeroizing<String>` at the chunk-20 boundary, so the
+  user-visible copy on the CLI side IS wiped after `write_all`
+  returns. The engine-internal `String` that the handler `move`s
+  out of the result struct is the residual: the allocation
+  pre-dates the `Zeroizing::new` wrap and the inner bytes are
+  the same heap region, so wrapping at the CLI boundary does not
+  retroactively zeroize the engine's allocation - only the CLI's
+  re-wrapped view. Same residual class as the `serde_json`
+  intermediate and the `VaultEntry.value` write-path heap copy
+  above. Full closure (returning `Zeroizing<String>` directly
+  from the engine's `EngineScrubResult.output` /
+  `EngineRestoreResult.output`) is deferred to M4a's vault
+  hardening together with the chunk-18 / chunk-19 sibling
+  residuals - landing the engine-side type change in M1 would
+  reshape chunk-9 / chunk-10 engine code with no user-facing
+  benefit while half the sibling class (the read-path
+  `serde_json` intermediate) stays open. The restore output is
+  the more sensitive of the two (it holds reconstructed real
+  secrets); chunk 20's leak-harness boundary tests confirm those
+  bytes appear only on the user's chosen stdout channel and
+  nowhere else, which is the M1-grade defence pending M4a's
+  engine-side closure.
 - **macOS `F_FULLFSYNC` is not used.** Standard `fsync` on macOS
   does not guarantee durability against unexpected power loss.
   A power-loss within ~milliseconds of a vault write on macOS

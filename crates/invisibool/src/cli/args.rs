@@ -1,6 +1,6 @@
 //! `clap` derive definitions for `invisibool`.
 //!
-//! Surface (M1 chunk 19):
+//! Surface (M1 chunks 19-20):
 //!
 //! ```text
 //! invisibool [--vault <PATH>] <SUBCOMMAND>
@@ -8,7 +8,26 @@
 //!   register <LABEL>     Add a new secret to the vault (value via TTY prompt or stdin pipe).
 //!   list                 Print labels + kinds for every entry. Never prints the value.
 //!   forget <LABEL>       Remove an entry. Exits 4 if the label does not exist.
+//!   scrub  [FILE]        Read input from FILE or stdin, write scrubbed text to stdout.
+//!   restore [FILE]       Read input from FILE or stdin, write restored text to stdout.
 //! ```
+//!
+//! ## `scrub` / `restore` shape (chunk 20)
+//!
+//! Both take exactly one optional positional: `FILE`. Stdin is the
+//! default source. There is NO `--watch`, `--monitor`, `--clipboard`,
+//! or any flag that would change the trigger from "the user typed
+//! the command" to a background source. That invariant is the
+//! "restore is explicit-only, never inferred" non-negotiable, and
+//! the scrub/restore-subcommand-shape pins in this file fail if any
+//! such flag is added.
+//!
+//! `--session FILE` (M1 spec) lands as an ADDITIVE follow-on in
+//! chunk 20.5 (an optional flag that, when present, threads a
+//! session-map file through the engine's `scrub_with_session` /
+//! `restore_with_session` entry points). Adding it does not reshape
+//! the handler body; chunk 20 deliberately leaves the seat empty so
+//! 20.5 is a slot-in, not a restructure.
 //!
 //! ## Security-critical clap shape
 //!
@@ -92,6 +111,36 @@ pub enum Command {
         /// The label whose entry to remove.
         #[arg(value_name = "LABEL")]
         label: String,
+    },
+    /// Read input from FILE (or stdin if FILE is omitted), substitute
+    /// format-preserving fakes for every registered or detected
+    /// secret, and write the result to stdout. The scrubbed text is
+    /// safe to paste into an LLM. Per-event indications and any
+    /// unrestorability notices go to stderr; stdout carries ONLY the
+    /// scrubbed text so it can be piped cleanly into the next tool.
+    Scrub {
+        /// Optional input file. If omitted, the CLI reads stdin to
+        /// EOF. The path is the ONLY positional and the ONLY input
+        /// source; there is no `--from-env`, `--clipboard`, or
+        /// `--watch` flag (those would convert scrub from
+        /// "operate on the bytes the user passed" to "trigger on
+        /// other channels", which the non-negotiables forbid).
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
+    /// Read input from FILE (or stdin if FILE is omitted), recover
+    /// the registered real value behind every FF1 fake the engine
+    /// recognises, and write the result to stdout. Restore operates
+    /// ONLY on the bytes the user passes: never on the clipboard,
+    /// never on a background source, never inferred from
+    /// scrubbed-looking text outside the input scope. Bytes that
+    /// are not the engine's fakes (random base62 strings,
+    /// fake-shape-but-not-our-fake content) are left unchanged.
+    Restore {
+        /// Optional input file. If omitted, the CLI reads stdin to
+        /// EOF. Same explicit-only rationale as `scrub`'s FILE.
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
     },
 }
 
@@ -190,6 +239,81 @@ mod tests {
                 .map(|a| a.get_id().as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ----- LOAD-BEARING: scrub/restore have only the optional FILE -----
+    //
+    // These pins are the structural enforcement of invariant 1
+    // ("restore is explicit-only, never inferred") at the parser
+    // layer. Each subcommand must accept ONLY:
+    //   - the optional FILE positional (the user's explicit input scope), and
+    //   - the global --vault flag (a path, not a secret value).
+    //
+    // No `--watch`, `--monitor`, `--clipboard`, `--from-env`,
+    // `--auto`, `--background`, etc. The test asserts the actual arg
+    // set so that a drift fails CI with a clear list of the new args.
+    #[test]
+    fn scrub_subcommand_has_only_optional_file_and_global_vault() {
+        let cmd = Cli::command();
+        let scrub = cmd
+            .find_subcommand("scrub")
+            .expect("the scrub subcommand must exist");
+        // Exclude clap-auto `--help` and the global `--vault` from
+        // the assertion - we are pinning OUR scrub-specific surface.
+        let our_args: Vec<&clap::Arg> = scrub
+            .get_arguments()
+            .filter(|a| a.get_id() != "help" && a.get_id() != "vault")
+            .collect();
+        assert_eq!(
+            our_args.len(),
+            1,
+            "scrub must declare exactly ONE argument beyond --help/--vault \
+             (the optional FILE positional). Found: {:?}",
+            our_args
+                .iter()
+                .map(|a| a.get_id().as_str())
+                .collect::<Vec<_>>()
+        );
+        let only = our_args[0];
+        assert!(
+            only.is_positional(),
+            "scrub's only argument must be positional (FILE); a named flag \
+             could become a non-explicit input trigger (--watch / --clipboard / \
+             --from-env), which violates the explicit-only invariant. Got: {:?}",
+            only.get_id().as_str()
+        );
+        assert_eq!(only.get_id().as_str(), "file");
+    }
+
+    #[test]
+    fn restore_subcommand_has_only_optional_file_and_global_vault() {
+        let cmd = Cli::command();
+        let restore = cmd
+            .find_subcommand("restore")
+            .expect("the restore subcommand must exist");
+        let our_args: Vec<&clap::Arg> = restore
+            .get_arguments()
+            .filter(|a| a.get_id() != "help" && a.get_id() != "vault")
+            .collect();
+        assert_eq!(
+            our_args.len(),
+            1,
+            "restore must declare exactly ONE argument beyond --help/--vault \
+             (the optional FILE positional). A `--clipboard`, `--watch`, or \
+             `--auto` flag here would break the explicit-only invariant - \
+             restore must only ever operate on bytes the user explicitly \
+             passed in. Found: {:?}",
+            our_args
+                .iter()
+                .map(|a| a.get_id().as_str())
+                .collect::<Vec<_>>()
+        );
+        let only = our_args[0];
+        assert!(
+            only.is_positional(),
+            "restore's only argument must be positional (FILE)."
+        );
+        assert_eq!(only.get_id().as_str(), "file");
     }
 
     // ----- clap self-test: the derived parser is internally consistent -----
