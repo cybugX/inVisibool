@@ -44,13 +44,18 @@
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
 use invisibool_engine::engine::ScrubNotice;
 use invisibool_engine::keychain::KeychainBackend;
+use invisibool_engine::session_file::{
+    wipe_session_file, SessionContents, SessionFileError, SessionPair, SESSION_TTL_SECS,
+};
 use invisibool_engine::tokenizer::alphabet::Alphabet;
 use invisibool_engine::tokenizer::fpe::{check_eligibility, SessionFakeKind};
+use invisibool_engine::tokenizer::session::SessionMap;
 use invisibool_engine::vault::{
     self, default_vault_path, EntryKindSummary, StdVaultIo, Vault, VaultEntry, VaultEntryKind,
     VaultIo,
@@ -224,32 +229,124 @@ fn format_notice(n: &ScrubNotice) -> String {
     }
 }
 
-/// `invisibool [--vault PATH] scrub [FILE]`. Returns 0 on success.
+/// Bounded but generous entry-count cap for the per-CLI-call
+/// [`SessionMap`]. A single scrub/restore invocation only ever passes
+/// through the map once, so LRU eviction never fires in practice;
+/// the cap exists so a pathologically-huge session file doesn't
+/// silently overflow. If a user actually scrubs 4096 session-mapped
+/// values in one prompt, later chunks (session ls|clear, watch)
+/// raise it or reject at load.
+const CLI_SESSION_MAP_CAPACITY: usize = 4096;
+
+/// Wall-clock helper. Kept out of scrub/restore's signature so the
+/// production glue can call it directly and tests inject a fixed
+/// value via the `now_epoch: u64` argument the handlers actually
+/// take.
+pub fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `invisibool [--vault PATH] scrub [FILE] [--session PATH]`.
+/// Returns 0 on success.
 ///
 /// - Reads input from `input` (already a `Zeroizing<String>` so the
-///   caller controls the I/O - tests inject buffers directly, the
+///   caller controls the I/O; tests inject buffers directly, the
 ///   binary's `run()` glue calls [`read_input`] for stdin/file).
-/// - Calls [`Engine::scrub`] over the input.
-/// - Writes the scrubbed text to `out` (stdout in production).
-///   Output is wrapped in a `Zeroizing<String>` at the CLI boundary
-///   so the buffer is wiped on drop after `write_all` returns; see
-///   THREAT_MODEL row 14 chunk-20 sub-residual for the engine-side
-///   `EngineScrubResult.output` deferral.
+/// - When `session_path` is `None`: calls [`Engine::scrub`]
+///   (stateless-FF1 chunk-20 behavior). The `SessionMappedUnrestorable`
+///   notices from the engine list every non-FF1 value that got faked
+///   into an unrestorable fake - the spec's "unrestorability is
+///   never silent" discipline.
+/// - When `session_path` is `Some(path)`:
+///   - Loads-or-creates a [`SessionContents`] at `path` via
+///     [`Vault::load_session_file`]. Missing file: create fresh at
+///     `now_epoch`. Existing valid file: merge, preserving the
+///     ORIGINAL `expires_at` - a repeat scrub does NOT reset the
+///     TTL, so repeated scrubbing cannot keep a session alive
+///     forever.
+///   - Calls [`Engine::scrub_with_session`], which suppresses the
+///     `SessionMappedUnrestorable` notices (the value IS
+///     restorable through the session file).
+///   - Saves the updated session file back to `path`.
+/// - Writes the scrubbed text to `out` wrapped in
+///   [`Zeroizing<String>`] at the CLI boundary; engine-side
+///   `EngineScrubResult.output` residual is deferred to M4a
+///   (THREAT_MODEL row 14).
 /// - Writes one notice line per [`ScrubNotice`] to `err`, then a
-///   one-line "scrubbed N value(s)" summary - the chunk-20
-///   "every scrub event surfaces a visible indication" + "unrestorability
-///   is always disclosed" non-negotiable.
+///   one-line "scrubbed N value(s)" summary.
+///
+/// `now_epoch` is Unix seconds. Production callers pass
+/// [`now_epoch_secs()`]; tests inject known constants so the
+/// expiry-refuses and merge-preserves-expiry cases are deterministic.
+#[allow(clippy::too_many_arguments)]
 pub fn scrub<K: KeychainBackend, W: Write, E: Write>(
     vault_path: &Path,
     keychain: &K,
     io: &dyn VaultIo,
     input: Zeroizing<String>,
+    session_path: Option<&Path>,
+    now_epoch: u64,
     out: &mut W,
     err: &mut E,
 ) -> Result<i32, CommandError> {
     let v = Vault::open(io, vault_path, keychain).map_err(CommandError::Vault)?;
     let engine = v.build_engine().map_err(CommandError::Vault)?;
-    let result = engine.scrub(input.as_str());
+
+    let result = match session_path {
+        None => engine.scrub(input.as_str()),
+        Some(path) => {
+            // Load-or-create session contents. A missing file is a
+            // signal (Ok(None)), not an error; any other failure -
+            // NotASessionFile, Expired, AeadDecrypt - is fatal so
+            // the user cannot accidentally overwrite an unrelated
+            // file or silently reset a mandatory TTL.
+            let existing = v
+                .load_session_file(io, path, now_epoch)
+                .map_err(CommandError::Session)?;
+            let (mut contents, ttl_secs_remaining) = match existing {
+                Some(c) => {
+                    let remaining = c.expires_at.saturating_sub(now_epoch);
+                    (c, remaining)
+                }
+                None => (SessionContents::new_at(now_epoch), SESSION_TTL_SECS),
+            };
+
+            // Seed a SessionMap with the existing pairs. TTL matches
+            // the file's remaining life so an in-process TTL prune
+            // cannot outlive the on-disk expiry.
+            let mut map = SessionMap::new(
+                CLI_SESSION_MAP_CAPACITY,
+                Duration::from_secs(ttl_secs_remaining.max(1)),
+            );
+            let import_iter = contents
+                .entries
+                .iter()
+                .map(|p| (p.fake.clone(), p.real.clone()));
+            let now_instant = Instant::now();
+            map.import(import_iter, now_instant);
+
+            let r = engine.scrub_with_session(input.as_str(), &mut map, now_instant);
+
+            // Rebuild the entries list from the (possibly-grown)
+            // map. The original created_at / expires_at are
+            // preserved verbatim - repeat scrubs do NOT push the
+            // expiry forward.
+            contents.entries = map
+                .entries()
+                .map(|(fake, real)| SessionPair {
+                    fake: fake.to_string(),
+                    real: real.to_string(),
+                })
+                .collect();
+            v.save_session_file(io, path, &contents)
+                .map_err(CommandError::Session)?;
+            r
+        }
+    };
+
     let scrubbed_out: Zeroizing<String> = Zeroizing::new(result.output);
     out.write_all(scrubbed_out.as_bytes())
         .map_err(CommandError::Io)?;
@@ -260,31 +357,124 @@ pub fn scrub<K: KeychainBackend, W: Write, E: Write>(
     Ok(0)
 }
 
-/// `invisibool [--vault PATH] restore [FILE]`. Returns 0 on success.
+/// `invisibool [--vault PATH] restore [FILE] [--session PATH]`.
+/// Returns 0 on success.
 ///
-/// Same shape as `scrub`. Restore operates ONLY on the bytes passed
-/// in `input`: it does not read the clipboard, does not poll, does
-/// not infer from "scrubbed-looking" text. Recognition is purely
-/// mechanical (FF1 trial-decrypt against registered values); bytes
-/// that aren't engine-produced FF1 fakes pass through unchanged.
+/// Same shape as [`scrub`]. Restore operates ONLY on the bytes
+/// passed in `input`: it does not read the clipboard, does not
+/// poll, does not infer from "scrubbed-looking" text. Recognition
+/// is purely mechanical (FF1 trial-decrypt against registered
+/// values, plus SessionMap lookup when `--session` is passed);
+/// bytes that aren't engine-produced fakes pass through unchanged.
+///
+/// - When `session_path` is `None`: stateless [`Engine::restore`],
+///   chunk-20 behavior unchanged.
+/// - When `session_path` is `Some(path)`:
+///   - Loads the session file. A MISSING file is fatal - the flag
+///     never silently degrades to stateless restore.
+///   - Counts how many session entries are `present` in the input
+///     BEFORE the engine call (the difference between total and
+///     present is the number of mappings destroyed by the wipe).
+///   - Calls [`Engine::restore_with_session`].
+///   - Unlinks the session file (spec A6 design 2:
+///     "restore --session consumes the file and wipes it").
+///     Unlink, not shred - the confidentiality mitigation is AEAD +
+///     keychain custody per THREAT_MODEL row 15.
+///   - Stderr summary reports both the restored count AND the count
+///     of discarded-with-wipe entries so the destruction is
+///     visible, per the never-silent discipline.
+///
 /// Output wrapped in `Zeroizing<String>` at the CLI boundary - the
 /// restore output buffer carries real recovered secrets and is the
 /// most sensitive transient in the tool.
+#[allow(clippy::too_many_arguments)]
 pub fn restore<K: KeychainBackend, W: Write, E: Write>(
     vault_path: &Path,
     keychain: &K,
     io: &dyn VaultIo,
     input: Zeroizing<String>,
+    session_path: Option<&Path>,
+    now_epoch: u64,
     out: &mut W,
     err: &mut E,
 ) -> Result<i32, CommandError> {
     let v = Vault::open(io, vault_path, keychain).map_err(CommandError::Vault)?;
     let engine = v.build_engine().map_err(CommandError::Vault)?;
-    let result = engine.restore(input.as_str());
+
+    let (result, unused_entries) = match session_path {
+        None => (engine.restore(input.as_str()), 0usize),
+        Some(path) => {
+            let contents = v
+                .load_session_file(io, path, now_epoch)
+                .map_err(CommandError::Session)?
+                .ok_or_else(|| {
+                    CommandError::Session(SessionFileError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "session file '{}' not found; `restore --session` \
+                             never silently degrades to stateless restore",
+                            path.display()
+                        ),
+                    )))
+                })?;
+
+            let total_entries = contents.entries.len();
+            let present_entries = contents
+                .entries
+                .iter()
+                .filter(|p| input.contains(&p.fake))
+                .count();
+            let unused = total_entries.saturating_sub(present_entries);
+
+            let ttl_secs_remaining = contents.expires_at.saturating_sub(now_epoch).max(1);
+            let mut map = SessionMap::new(
+                CLI_SESSION_MAP_CAPACITY,
+                Duration::from_secs(ttl_secs_remaining),
+            );
+            let import_iter = contents.entries.into_iter().map(|p| (p.fake, p.real));
+            let now_instant = Instant::now();
+            map.import(import_iter, now_instant);
+
+            let r = engine.restore_with_session(input.as_str(), &mut map, now_instant);
+
+            // Wipe (unlink). If the wipe itself fails, surface a
+            // warning to stderr but keep the exit success - the
+            // restore itself worked, and the file's `expires_at`
+            // still bounds the residual regardless of whether we
+            // could remove it now.
+            if let Err(e) = wipe_session_file(path) {
+                writeln!(
+                    err,
+                    "warning: could not remove session file '{}': {}. \
+                     The file's `expires_at` still bounds its lifetime.",
+                    path.display(),
+                    e
+                )
+                .ok();
+            }
+
+            (r, unused)
+        }
+    };
+
     let restored_out: Zeroizing<String> = Zeroizing::new(result.output);
     out.write_all(restored_out.as_bytes())
         .map_err(CommandError::Io)?;
     writeln!(err, "restored {} value(s)", result.restored_count).ok();
+    if unused_entries > 0 {
+        // Visible destruction: the mappings the user might have
+        // expected to use on the next reply are gone with the
+        // wipe. Per spec's "unrestorability is never silent"
+        // discipline (and the chunk-21 gate addition), we say so
+        // explicitly.
+        writeln!(
+            err,
+            "{} session entr{} not present in this input, discarded with the session file.",
+            unused_entries,
+            if unused_entries == 1 { "y" } else { "ies" }
+        )
+        .ok();
+    }
     Ok(0)
 }
 
@@ -337,6 +527,7 @@ pub enum CommandError {
     Vault(invisibool_engine::vault::VaultError),
     #[allow(dead_code)]
     Io(io::Error),
+    Session(SessionFileError),
 }
 
 impl std::fmt::Display for CommandError {
@@ -344,6 +535,7 @@ impl std::fmt::Display for CommandError {
         match self {
             Self::Vault(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
+            Self::Session(e) => write!(f, "{e}"),
         }
     }
 }
@@ -393,7 +585,7 @@ pub fn run(
         crate::cli::args::Command::Forget { label } => {
             forget(&vault_path, keychain, io, &label, &mut stdout, &mut stderr)
         }
-        crate::cli::args::Command::Scrub { file } => {
+        crate::cli::args::Command::Scrub { file, session } => {
             let input = match read_input(file.as_deref()) {
                 Ok(b) => b,
                 Err(e) => {
@@ -401,9 +593,18 @@ pub fn run(
                     return 3;
                 }
             };
-            scrub(&vault_path, keychain, io, input, &mut stdout, &mut stderr)
+            scrub(
+                &vault_path,
+                keychain,
+                io,
+                input,
+                session.as_deref(),
+                now_epoch_secs(),
+                &mut stdout,
+                &mut stderr,
+            )
         }
-        crate::cli::args::Command::Restore { file } => {
+        crate::cli::args::Command::Restore { file, session } => {
             let input = match read_input(file.as_deref()) {
                 Ok(b) => b,
                 Err(e) => {
@@ -411,7 +612,16 @@ pub fn run(
                     return 3;
                 }
             };
-            restore(&vault_path, keychain, io, input, &mut stdout, &mut stderr)
+            restore(
+                &vault_path,
+                keychain,
+                io,
+                input,
+                session.as_deref(),
+                now_epoch_secs(),
+                &mut stdout,
+                &mut stderr,
+            )
         }
     };
     match result {
@@ -975,6 +1185,8 @@ mod tests {
                 &kc,
                 &io,
                 zeroizing(input),
+                None,
+                0,
                 &mut out,
                 &mut err,
             )
@@ -1024,6 +1236,8 @@ mod tests {
             &kc,
             &io,
             zeroizing(lookalike),
+            None,
+            0,
             &mut out,
             &mut err,
         )
@@ -1071,6 +1285,8 @@ mod tests {
                 &kc,
                 &io,
                 zeroizing(original),
+                None,
+                0,
                 &mut scrub_out,
                 &mut scrub_err,
             )
@@ -1085,6 +1301,8 @@ mod tests {
                 &kc,
                 &io,
                 zeroizing(&scrubbed),
+                None,
+                0,
                 &mut restore_out,
                 &mut restore_err,
             )
@@ -1140,6 +1358,8 @@ mod tests {
             &kc,
             &io,
             zeroizing(&input),
+            None,
+            0,
             &mut scrub_out,
             &mut scrub_err,
         )
@@ -1175,6 +1395,8 @@ mod tests {
             &kc,
             &io,
             zeroizing(&scrubbed),
+            None,
+            0,
             &mut restore_out,
             &mut restore_err,
         )
@@ -1208,6 +1430,8 @@ mod tests {
             &kc,
             &io,
             zeroizing(&input),
+            None,
+            0,
             &mut stdout,
             &mut stderr,
         )
@@ -1254,6 +1478,8 @@ mod tests {
             &kc,
             &io,
             zeroizing(&original),
+            None,
+            0,
             &mut s_out,
             &mut s_err,
         )
@@ -1268,6 +1494,8 @@ mod tests {
             &kc,
             &io,
             zeroizing(&scrubbed),
+            None,
+            0,
             &mut r_out,
             &mut r_err,
         )
@@ -1314,7 +1542,16 @@ mod tests {
         // succeed.
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let res = scrub(&junk, &kc, &io, zeroizing("anything"), &mut out, &mut err);
+        let res = scrub(
+            &junk,
+            &kc,
+            &io,
+            zeroizing("anything"),
+            None,
+            0,
+            &mut out,
+            &mut err,
+        );
         assert!(
             matches!(res, Err(CommandError::Vault(VaultError::BadMagic))),
             "scrub --vault must route through Vault::open and fail BadMagic on \
@@ -1329,11 +1566,876 @@ mod tests {
         // Same for restore.
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let res = restore(&junk, &kc, &io, zeroizing("anything"), &mut out, &mut err);
+        let res = restore(
+            &junk,
+            &kc,
+            &io,
+            zeroizing("anything"),
+            None,
+            0,
+            &mut out,
+            &mut err,
+        );
         assert!(
             matches!(res, Err(CommandError::Vault(VaultError::BadMagic))),
             "restore --vault must route through Vault::open and fail BadMagic on \
              a junk file; got {res:?}"
+        );
+    }
+
+    // ================================================================
+    // Chunk 21: --session PATH tests
+    // ================================================================
+    //
+    // These tests exercise the session-file wiring around chunk-20's
+    // handlers. Design invariants (per the chunk-21 gate):
+    //
+    // 1. The engine's `scrub_with_session` and `restore_with_session`
+    //    are ADDITIVE - passing `session_path = None` leaves chunk-20
+    //    behavior byte-identical (test:
+    //    `without_session_flag_scrub_still_emits_session_mapped_unrestorable_notice`).
+    //
+    // 2. The session file is AEAD-encrypted with a DISTINCT MAGIC so
+    //    wrong-file-kind fails as `NotASessionFile`, not as an AEAD
+    //    or JSON error (test:
+    //    `session_file_wrong_magic_fails_typed_not_crypto`).
+    //
+    // 3. A repeat scrub MERGES entries and PRESERVES `expires_at` -
+    //    never resets the TTL. Otherwise repeated scrubbing could
+    //    keep a session alive indefinitely. (test:
+    //    `scrub_with_session_second_time_merges_not_resets_expiry`).
+    //
+    // 4. `restore --session` DELETES the file after success. If
+    //    entries in the file were NOT present in the input, they are
+    //    destroyed by the wipe - the stderr summary must say so
+    //    explicitly (test:
+    //    `restore_with_session_reports_unused_entries_in_stderr_summary`).
+    //
+    // 5. Expired / missing / wrong-magic files FAIL CLOSED - never
+    //    silently reset, never silently degrade to stateless
+    //    (tests: `..._refuses_on_expired_file`,
+    //    `..._refuses_on_missing_file`, wrong-magic above).
+
+    use invisibool_engine::session_file::SESSION_TTL_SECS as ENGINE_SESSION_TTL_SECS;
+    use invisibool_engine::tokenizer::fpe::PiiKind;
+    use invisibool_engine::vault::VaultEntryKind as VEK;
+
+    /// Build a vault with one PII-Email registration + one FF1
+    /// registration under the same keychain. Used for scrub/restore
+    /// tests that exercise session-mapped restorability.
+    ///
+    /// Chunk 19's `register` CLI only dispatches Fpe / Formatless, so
+    /// building a PII-Email entry goes through the vault's direct
+    /// `Vault::register(VaultEntry { ... })` API instead. That is
+    /// deliberate: session-mapped kinds arrive via M3 detection at
+    /// the CLI layer; the vault type itself already supports them.
+    fn session_vault_with_pii_and_fpe(
+        tag: &str,
+        pii_label: &str,
+        pii_value: &str,
+        fpe_label: &str,
+        fpe_value: &str,
+    ) -> (TempVaultDir, InMemoryKeychain) {
+        let dir = TempVaultDir::new(tag);
+        let kc = InMemoryKeychain::new();
+        let io = StdVaultIo;
+        {
+            let mut v = Vault::open(&io, &dir.vault_path(), &kc).expect("open empty");
+            v.register(VaultEntry {
+                label: pii_label.to_string(),
+                value: pii_value.to_string(),
+                entry_kind: VEK::SessionMapped {
+                    kind: SessionFakeKind::Pii(PiiKind::Email),
+                },
+            });
+            v.register(VaultEntry {
+                label: fpe_label.to_string(),
+                value: fpe_value.to_string(),
+                entry_kind: VEK::Fpe {
+                    tweak: [0x33u8; 16],
+                    prefix: String::new(),
+                    alphabet: DEFAULT_FPE_ALPHABET_NAME.to_string(),
+                },
+            });
+            v.save(&io, &dir.vault_path()).expect("save");
+        }
+        (dir, kc)
+    }
+
+    fn session_path(dir: &TempVaultDir, name: &str) -> PathBuf {
+        dir.path.join(name)
+    }
+
+    /// Load a session file directly (bypassing the CLI handler) so
+    /// tests can inspect the on-disk contents. Uses the vault to
+    /// borrow the AEAD key.
+    fn load_session_via_vault(
+        dir: &TempVaultDir,
+        kc: &InMemoryKeychain,
+        io: &dyn VaultIo,
+        session_path: &Path,
+        now: u64,
+    ) -> Option<SessionContents> {
+        let v = Vault::open(io, &dir.vault_path(), kc).expect("open vault");
+        v.load_session_file(io, session_path, now).expect("load OK")
+    }
+
+    // ----- ADDITIVE: chunk-20 no-session behavior unchanged -----
+
+    #[test]
+    fn without_session_flag_scrub_still_emits_session_mapped_unrestorable_notice() {
+        // Chunk-21 regression pin: the additive `session_path = None`
+        // branch must leave the pre-chunk-21 notice behavior in
+        // place. If a future refactor accidentally suppresses the
+        // notice in the None case, this test catches it.
+        let (dir, kc) = session_vault_with_pii_and_fpe(
+            "chunk21-no-session",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+
+        let input = "please send alice@example.com the info";
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let exit = scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing(input),
+            None, // no --session
+            0,
+            &mut out,
+            &mut err,
+        )
+        .expect("scrub OK");
+        assert_eq!(exit, 0);
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("session-mapped fake") && stderr.contains("email"),
+            "no --session must still emit SessionMappedUnrestorable notice: {stderr:?}"
+        );
+    }
+
+    // ----- Basic scrub-then-restore round trip with session file -----
+
+    #[test]
+    fn scrub_with_session_creates_aead_file_with_expected_mode_and_magic() {
+        let (dir, kc) = session_vault_with_pii_and_fpe(
+            "chunk21-file-mode",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+        let sp = session_path(&dir, "s.bin");
+
+        let input = "email is alice@example.com and token is HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs";
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let now = 1_000_000_u64;
+        let exit = scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing(input),
+            Some(&sp),
+            now,
+            &mut out,
+            &mut err,
+        )
+        .expect("scrub OK");
+        assert_eq!(exit, 0);
+
+        // File exists and is mode 0o600.
+        assert!(sp.exists(), "session file must be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sp).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "session file mode must be 0o600, got {mode:o}");
+        }
+
+        // First 16 bytes are the session MAGIC (distinct from vault).
+        let bytes = std::fs::read(&sp).unwrap();
+        assert!(bytes.len() >= 16);
+        assert_eq!(
+            &bytes[..16],
+            b"INVISIBOOL_SESSN",
+            "session file must start with the distinct session MAGIC"
+        );
+        assert_ne!(
+            &bytes[..16],
+            b"INVISIBOOL_VAULT",
+            "session file must NOT share the vault MAGIC (type-confusion guard)"
+        );
+
+        // Loading it back yields our email pair, with a preserved TTL.
+        let contents =
+            load_session_via_vault(&dir, &kc, &io, &sp, now + 1).expect("Some(contents)");
+        assert_eq!(contents.created_at, now);
+        assert_eq!(contents.expires_at, now + ENGINE_SESSION_TTL_SECS);
+        assert!(
+            contents
+                .entries
+                .iter()
+                .any(|p| p.real == "alice@example.com"),
+            "session file must contain the alice@example.com pair"
+        );
+    }
+
+    #[test]
+    fn restore_with_session_recovers_pii_and_wipes_file() {
+        let (dir, kc) = session_vault_with_pii_and_fpe(
+            "chunk21-restore-wipe",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+        let sp = session_path(&dir, "s.bin");
+        let now = 2_000_000_u64;
+
+        // Scrub with session.
+        let original = "email alice@example.com and token HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs";
+        let mut s_out = Vec::new();
+        let mut s_err = Vec::new();
+        scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing(original),
+            Some(&sp),
+            now,
+            &mut s_out,
+            &mut s_err,
+        )
+        .expect("scrub OK");
+        let scrubbed = String::from_utf8(s_out).unwrap();
+        // The scrubbed text must not contain the real email (the fake
+        // takes its place).
+        assert!(
+            !scrubbed.contains("alice@example.com"),
+            "scrubbed text must not carry the real email: {scrubbed:?}"
+        );
+        // And no SessionMappedUnrestorable notice should appear when
+        // --session is active - the value IS restorable via the file.
+        let scrub_stderr = String::from_utf8(s_err).unwrap();
+        assert!(
+            !scrub_stderr.contains("session-mapped fake"),
+            "SessionMappedUnrestorable notice must NOT fire with --session: \
+             {scrub_stderr:?}"
+        );
+        assert!(sp.exists(), "file must exist after scrub");
+
+        // Restore with session.
+        let mut r_out = Vec::new();
+        let mut r_err = Vec::new();
+        let exit = restore(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing(&scrubbed),
+            Some(&sp),
+            now + 1,
+            &mut r_out,
+            &mut r_err,
+        )
+        .expect("restore OK");
+        assert_eq!(exit, 0);
+        let restored = String::from_utf8(r_out).unwrap();
+        assert_eq!(
+            restored, original,
+            "session-mapped PII must round-trip byte-exact: {restored:?}"
+        );
+
+        // File is GONE.
+        assert!(
+            !sp.exists(),
+            "session file must be unlinked by restore --session"
+        );
+
+        // No unused-entries line: everything in the file was present
+        // in input (both the email and the FF1 fake).
+        let restore_stderr = String::from_utf8(r_err).unwrap();
+        assert!(
+            !restore_stderr.contains("discarded with the session file"),
+            "no discard line expected (all entries were used): {restore_stderr:?}"
+        );
+        assert!(
+            restore_stderr.contains("restored 2 value(s)"),
+            "restore summary must include the session-restored count \
+             (1 PII email + 1 FF1 token = 2 total): {restore_stderr:?}"
+        );
+    }
+
+    // ----- LOAD-BEARING: merge preserves expires_at -----
+
+    #[test]
+    fn scrub_with_session_second_time_merges_not_resets_expiry() {
+        // Register TWO PII entries so we can prove the second scrub
+        // adds one without moving the file's expires_at.
+        let dir = TempVaultDir::new("chunk21-merge-preserves-expiry");
+        let kc = InMemoryKeychain::new();
+        let io = StdVaultIo;
+        {
+            let mut v = Vault::open(&io, &dir.vault_path(), &kc).expect("open");
+            v.register(VaultEntry {
+                label: "email-a".to_string(),
+                value: "alice@example.com".to_string(),
+                entry_kind: VEK::SessionMapped {
+                    kind: SessionFakeKind::Pii(PiiKind::Email),
+                },
+            });
+            v.register(VaultEntry {
+                label: "email-b".to_string(),
+                value: "bob@example.com".to_string(),
+                entry_kind: VEK::SessionMapped {
+                    kind: SessionFakeKind::Pii(PiiKind::Email),
+                },
+            });
+            v.save(&io, &dir.vault_path()).expect("save");
+        }
+
+        let sp = session_path(&dir, "s.bin");
+        let t0 = 1_000_000_u64;
+        // First scrub at t0 - only mentions Alice.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing("please email alice@example.com"),
+            Some(&sp),
+            t0,
+            &mut out,
+            &mut err,
+        )
+        .expect("scrub 1 OK");
+        let after_first =
+            load_session_via_vault(&dir, &kc, &io, &sp, t0 + 1).expect("Some after scrub 1");
+        let expiry_after_first = after_first.expires_at;
+        assert_eq!(after_first.created_at, t0);
+        assert_eq!(expiry_after_first, t0 + ENGINE_SESSION_TTL_SECS);
+        let entries_after_first = after_first.entries.len();
+        assert_eq!(entries_after_first, 1, "one email pair after scrub 1");
+
+        // Second scrub 5 minutes later, over an input that mentions
+        // Bob. `expires_at` MUST NOT move; entries count MUST grow.
+        let t1 = t0 + 5 * 60;
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing("also email bob@example.com"),
+            Some(&sp),
+            t1,
+            &mut out2,
+            &mut err2,
+        )
+        .expect("scrub 2 OK");
+        let after_second =
+            load_session_via_vault(&dir, &kc, &io, &sp, t1 + 1).expect("Some after scrub 2");
+        assert_eq!(
+            after_second.created_at, t0,
+            "created_at must remain the first-scrub timestamp, not move to t1. \
+             Got: {} (want {t0})",
+            after_second.created_at
+        );
+        assert_eq!(
+            after_second.expires_at, expiry_after_first,
+            "expires_at MUST NOT move when a second scrub merges into an existing \
+             session file. Otherwise repeated scrubs could keep a session alive \
+             indefinitely, defeating the spec's mandatory short TTL. Got \
+             expires_at = {} (want {})",
+            after_second.expires_at, expiry_after_first
+        );
+        assert!(
+            after_second.entries.len() >= entries_after_first,
+            "second scrub must not shrink the entry set: was {}, now {}",
+            entries_after_first,
+            after_second.entries.len()
+        );
+    }
+
+    // ----- Refuse expired file -----
+
+    #[test]
+    fn scrub_with_session_refuses_on_expired_file() {
+        let (dir, kc) = session_vault_with_pii_and_fpe(
+            "chunk21-expired-scrub",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+        let sp = session_path(&dir, "s.bin");
+        let t_write = 1_000_000_u64;
+        // Write with expires_at = t_write + TTL. Read at t_read past
+        // expiry.
+        {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            scrub(
+                &dir.vault_path(),
+                &kc,
+                &io,
+                zeroizing("mention alice@example.com"),
+                Some(&sp),
+                t_write,
+                &mut out,
+                &mut err,
+            )
+            .expect("scrub OK");
+        }
+        let t_read = t_write + ENGINE_SESSION_TTL_SECS + 1;
+
+        // Second scrub past expiry MUST refuse.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let res = scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing("mention bob@example.com"),
+            Some(&sp),
+            t_read,
+            &mut out,
+            &mut err,
+        );
+        assert!(
+            matches!(
+                res,
+                Err(CommandError::Session(SessionFileError::Expired { .. }))
+            ),
+            "expired session file must refuse with typed Expired, not silently \
+             reset: got {res:?}"
+        );
+    }
+
+    #[test]
+    fn restore_with_session_refuses_on_expired_file() {
+        let (dir, kc) = session_vault_with_pii_and_fpe(
+            "chunk21-expired-restore",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+        let sp = session_path(&dir, "s.bin");
+        let t_write = 1_000_000_u64;
+        {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            scrub(
+                &dir.vault_path(),
+                &kc,
+                &io,
+                zeroizing("mention alice@example.com"),
+                Some(&sp),
+                t_write,
+                &mut out,
+                &mut err,
+            )
+            .expect("scrub OK");
+        }
+        let t_read = t_write + ENGINE_SESSION_TTL_SECS + 1;
+
+        let mut r_out = Vec::new();
+        let mut r_err = Vec::new();
+        let res = restore(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing("some fake text"),
+            Some(&sp),
+            t_read,
+            &mut r_out,
+            &mut r_err,
+        );
+        assert!(
+            matches!(
+                res,
+                Err(CommandError::Session(SessionFileError::Expired { .. }))
+            ),
+            "expired file must refuse restore too: got {res:?}"
+        );
+        // File is UNTOUCHED - expired reads do not delete.
+        assert!(
+            sp.exists(),
+            "an expired-refusal MUST NOT delete the file (the user might \
+             want to inspect it or copy it before removing)"
+        );
+    }
+
+    // ----- Refuse missing file (fail closed, never silent stateless) -----
+
+    #[test]
+    fn restore_with_session_refuses_on_missing_file() {
+        let (dir, kc) = session_vault_with_pii_and_fpe(
+            "chunk21-missing-restore",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+        let sp = session_path(&dir, "never-created.bin");
+        assert!(!sp.exists());
+
+        let mut r_out = Vec::new();
+        let mut r_err = Vec::new();
+        let res = restore(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing("some text"),
+            Some(&sp),
+            1_000_000,
+            &mut r_out,
+            &mut r_err,
+        );
+        // Missing file must be a typed session error, NOT a silent
+        // degrade-to-stateless. If the CLI ever "helpfully" ran
+        // stateless restore when the file didn't exist, a user
+        // running the same command twice would silently lose the
+        // session-mapped restoration path on the second run.
+        assert!(
+            matches!(res, Err(CommandError::Session(_))),
+            "missing session file must fail closed: got {res:?}"
+        );
+    }
+
+    // ----- Wrong-magic typed error (not raw AEAD failure) -----
+
+    #[test]
+    fn session_file_wrong_magic_fails_typed_not_crypto() {
+        let (dir, kc) = session_vault_with_pii_and_fpe(
+            "chunk21-wrong-magic",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+        // First save a real vault (already saved by
+        // session_vault_with_pii_and_fpe). Try to use the vault file
+        // AS a session file - MAGIC mismatches (INVISIBOOL_VAULT vs
+        // INVISIBOOL_SESSN). Under a shared vault key this is exactly
+        // where type confusion would silently succeed at the AEAD
+        // layer if we hadn't chosen a distinct MAGIC; the typed
+        // NotASessionFile error is our load-bearing guard.
+        let vault_path_as_session = dir.vault_path();
+        assert!(vault_path_as_session.exists());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let res = scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing("mention alice@example.com"),
+            Some(&vault_path_as_session),
+            1_000_000,
+            &mut out,
+            &mut err,
+        );
+        assert!(
+            matches!(
+                res,
+                Err(CommandError::Session(SessionFileError::NotASessionFile))
+            ),
+            "pointing --session at a vault file must fail with NotASessionFile, \
+             NOT with AeadDecrypt or Serde - distinct MAGIC is the type-tag. \
+             Got: {res:?}"
+        );
+        // File is UNTOUCHED - refusal does not overwrite.
+        let bytes_after = std::fs::read(&vault_path_as_session).unwrap();
+        assert!(
+            bytes_after.starts_with(b"INVISIBOOL_VAULT"),
+            "vault file bytes must be untouched by the refusal"
+        );
+    }
+
+    // ----- Stdout cleanliness with --session -----
+
+    #[test]
+    fn scrub_with_session_writes_only_scrubbed_text_to_stdout() {
+        // Reuses chunk-20's channel-discipline shape: adding
+        // --session must NOT leak the fake<->real pairs into stdout
+        // or stderr. The session file is the ONE new output channel;
+        // stdout continues to carry ONLY the scrubbed text.
+        let (dir, kc) = session_vault_with_pii_and_fpe(
+            "chunk21-stdout-clean",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+        let sp = session_path(&dir, "s.bin");
+        let input = "hey alice@example.com please respond";
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing(input),
+            Some(&sp),
+            1_000_000,
+            &mut out,
+            &mut err,
+        )
+        .expect("scrub OK");
+        let scrubbed = String::from_utf8(out).unwrap();
+        let stderr_text = String::from_utf8(err).unwrap();
+
+        assert!(
+            !scrubbed.contains("alice@example.com"),
+            "stdout MUST NOT carry the real email: {scrubbed:?}"
+        );
+        assert!(
+            !scrubbed.contains("scrubbed") && !scrubbed.contains("notice"),
+            "stdout MUST NOT contain summary/notice contamination: {scrubbed:?}"
+        );
+        assert!(
+            !stderr_text.contains("alice@example.com"),
+            "stderr MUST NOT carry the real email either (the file is the ONE \
+             new output channel; stderr stays informational): {stderr_text:?}"
+        );
+        assert!(
+            stderr_text.contains("scrubbed 1 value(s)"),
+            "stderr must include the visible scrub-event count: {stderr_text:?}"
+        );
+    }
+
+    // ----- Empty session file: predictable presence -----
+
+    #[test]
+    fn scrub_with_session_with_no_session_mapped_values_still_writes_empty_session_file() {
+        // A vault with only FF1 entries (no PII/Card/Formatless)
+        // still writes a session file when --session PATH is passed,
+        // so the presence of the file is predictable and the leak
+        // harness has a consistent artifact to check. The file
+        // decrypts to zero entries; a subsequent restore no-ops the
+        // session pass and wipes the file.
+        let (dir, kc) = fpe_vault_with(
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+            "chunk21-empty-session",
+        );
+        let io = StdVaultIo;
+        let sp = session_path(&dir, "s.bin");
+        let now = 1_000_000_u64;
+        let input = "no session-mapped values here";
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing(input),
+            Some(&sp),
+            now,
+            &mut out,
+            &mut err,
+        )
+        .expect("scrub OK");
+        assert!(sp.exists(), "session file MUST be created even when empty");
+
+        // File loads and has zero entries.
+        let v = Vault::open(&io, &dir.vault_path(), &kc).expect("open");
+        let contents = v
+            .load_session_file(&io, &sp, now + 1)
+            .expect("load OK")
+            .expect("Some(contents)");
+        assert_eq!(contents.entries.len(), 0);
+
+        // Restore also no-ops and wipes.
+        let mut r_out = Vec::new();
+        let mut r_err = Vec::new();
+        restore(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing("anything"),
+            Some(&sp),
+            now + 1,
+            &mut r_out,
+            &mut r_err,
+        )
+        .expect("restore OK");
+        assert!(!sp.exists(), "session file must be unlinked by restore");
+    }
+
+    // ----- Discard visibility on wipe (chunk-21 gate addition) -----
+
+    #[test]
+    fn restore_with_session_reports_unused_entries_in_stderr_summary() {
+        // The spec-mandated wipe on restore destroys the file
+        // wholesale - including entries whose fake did NOT appear in
+        // the input the user just handed to `restore --session`. That
+        // is a silent-destruction hazard: the user might have expected
+        // to use those mappings on the next reply.
+        //
+        // The chunk-21 gate: name the count in stderr. "M session
+        // entries not present in this input, discarded with the
+        // session file." Never silent.
+        let dir = TempVaultDir::new("chunk21-unused-discard");
+        let kc = InMemoryKeychain::new();
+        let io = StdVaultIo;
+        {
+            let mut v = Vault::open(&io, &dir.vault_path(), &kc).expect("open");
+            v.register(VaultEntry {
+                label: "email-a".to_string(),
+                value: "alice@example.com".to_string(),
+                entry_kind: VEK::SessionMapped {
+                    kind: SessionFakeKind::Pii(PiiKind::Email),
+                },
+            });
+            v.register(VaultEntry {
+                label: "email-b".to_string(),
+                value: "bob@example.com".to_string(),
+                entry_kind: VEK::SessionMapped {
+                    kind: SessionFakeKind::Pii(PiiKind::Email),
+                },
+            });
+            v.save(&io, &dir.vault_path()).expect("save");
+        }
+        let sp = session_path(&dir, "s.bin");
+        let t0 = 1_000_000_u64;
+
+        // Scrub both emails so both pairs land in the session file.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        scrub(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing("hi alice@example.com and bob@example.com"),
+            Some(&sp),
+            t0,
+            &mut out,
+            &mut err,
+        )
+        .expect("scrub OK");
+        let scrubbed = String::from_utf8(out).unwrap();
+
+        // Read the file back to find alice's fake specifically.
+        let contents = load_session_via_vault(&dir, &kc, &io, &sp, t0 + 1).expect("Some(contents)");
+        assert_eq!(contents.entries.len(), 2);
+        let alice_fake = contents
+            .entries
+            .iter()
+            .find(|p| p.real == "alice@example.com")
+            .map(|p| p.fake.clone())
+            .expect("alice pair present");
+        // Sanity: the scrubbed text contains alice's fake.
+        assert!(scrubbed.contains(&alice_fake));
+
+        // Now hand `restore --session` only the alice fake - bob's
+        // fake is NOT in this input. Bob's pair is destroyed by the
+        // wipe; the stderr summary must say so.
+        let restore_input = format!("just this line with {alice_fake} in it");
+        let mut r_out = Vec::new();
+        let mut r_err = Vec::new();
+        restore(
+            &dir.vault_path(),
+            &kc,
+            &io,
+            zeroizing(&restore_input),
+            Some(&sp),
+            t0 + 1,
+            &mut r_out,
+            &mut r_err,
+        )
+        .expect("restore OK");
+        assert!(!sp.exists(), "wipe still happens");
+        let restore_stderr = String::from_utf8(r_err).unwrap();
+        assert!(
+            restore_stderr.contains(
+                "1 session entry not present in this input, discarded with the session file"
+            ) || restore_stderr.contains(
+                "1 session entries not present in this input, discarded with the session file"
+            ),
+            "stderr MUST report the count of destroyed-by-wipe entries; \
+             silent destruction of mappings the user might have expected to \
+             use on the next reply violates never-silent. Got: {restore_stderr:?}"
+        );
+    }
+
+    // ----- Cross-vault refusal: wrong key → typed AeadDecrypt -----
+
+    #[test]
+    fn session_file_wrong_vault_key_fails_typed_aead_decrypt() {
+        // A file written under vault A must not decrypt under vault
+        // B. Prevents one vault's session bleeding real values
+        // through another vault's process.
+        let (dir_a, kc_a) = session_vault_with_pii_and_fpe(
+            "chunk21-xvault-a",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let (dir_b, kc_b) = session_vault_with_pii_and_fpe(
+            "chunk21-xvault-b",
+            "email",
+            "alice@example.com",
+            "token",
+            "HVqf8KNw3aBxR4yU2pTeMnLcDbGjA7Zs",
+        );
+        let io = StdVaultIo;
+        let sp = session_path(&dir_a, "s.bin");
+        let now = 1_000_000_u64;
+
+        // Scrub under vault A.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        scrub(
+            &dir_a.vault_path(),
+            &kc_a,
+            &io,
+            zeroizing("hi alice@example.com"),
+            Some(&sp),
+            now,
+            &mut out,
+            &mut err,
+        )
+        .expect("scrub A OK");
+
+        // Try to restore under vault B (different keychain → different
+        // vault key → different session-AEAD subkey).
+        let mut r_out = Vec::new();
+        let mut r_err = Vec::new();
+        let res = restore(
+            &dir_b.vault_path(),
+            &kc_b,
+            &io,
+            zeroizing("anything"),
+            Some(&sp),
+            now + 1,
+            &mut r_out,
+            &mut r_err,
+        );
+        assert!(
+            matches!(
+                res,
+                Err(CommandError::Session(SessionFileError::AeadDecrypt))
+            ),
+            "cross-vault use must fail typed AeadDecrypt: got {res:?}"
         );
     }
 }

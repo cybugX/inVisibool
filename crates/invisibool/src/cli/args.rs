@@ -12,22 +12,26 @@
 //!   restore [FILE]       Read input from FILE or stdin, write restored text to stdout.
 //! ```
 //!
-//! ## `scrub` / `restore` shape (chunk 20)
+//! ## `scrub` / `restore` shape (chunks 20 and 21)
 //!
-//! Both take exactly one optional positional: `FILE`. Stdin is the
-//! default source. There is NO `--watch`, `--monitor`, `--clipboard`,
-//! or any flag that would change the trigger from "the user typed
-//! the command" to a background source. That invariant is the
-//! "restore is explicit-only, never inferred" non-negotiable, and
-//! the scrub/restore-subcommand-shape pins in this file fail if any
-//! such flag is added.
+//! Both take one optional positional (`FILE`) and one optional named
+//! flag (`--session PATH`). Stdin is the default input source. There
+//! is NO `--watch`, `--monitor`, `--clipboard`, or any flag that
+//! would change the trigger from "the user typed the command" to a
+//! background source. That invariant is the "restore is explicit-only,
+//! never inferred" non-negotiable, and the scrub/restore-subcommand-
+//! shape pins in this file fail if any such flag is added.
 //!
-//! `--session FILE` (M1 spec) lands as an ADDITIVE follow-on in
-//! chunk 20.5 (an optional flag that, when present, threads a
-//! session-map file through the engine's `scrub_with_session` /
-//! `restore_with_session` entry points). Adding it does not reshape
-//! the handler body; chunk 20 deliberately leaves the seat empty so
-//! 20.5 is a slot-in, not a restructure.
+//! `--session PATH` (chunk 21) threads a session-map file through
+//! the engine's `scrub_with_session` / `restore_with_session` entry
+//! points so PII / Card / Formatless registered values become
+//! restorable across two separate CLI invocations. The file itself
+//! is AEAD-encrypted under a subkey derived from the vault key, has
+//! a mandatory 30-minute TTL that a repeat scrub does NOT extend,
+//! and is unlinked by `restore --session PATH` after a successful
+//! restore. Path-only in chunk 21 (matches `--vault PATH`); a
+//! bare-name shorthand and the `$XDG_STATE_HOME` sessions-dir
+//! default arrive with `invisibool session ls|clear` in M4a.
 //!
 //! ## Security-critical clap shape
 //!
@@ -127,6 +131,16 @@ pub enum Command {
         /// other channels", which the non-negotiables forbid).
         #[arg(value_name = "FILE")]
         file: Option<PathBuf>,
+        /// Optional AEAD-encrypted session file. When present, PII /
+        /// Card / Formatless registered values become restorable via
+        /// `restore --session <same-path>`. Absent (the default):
+        /// stateless FF1 only, and the end-of-scrub notice lists
+        /// which values will NOT be restorable. The file has a fixed
+        /// 30-minute TTL that a repeat scrub does not extend; a
+        /// scrub against an expired or wrong-magic file fails
+        /// closed rather than silently resetting.
+        #[arg(long, value_name = "PATH")]
+        session: Option<PathBuf>,
     },
     /// Read input from FILE (or stdin if FILE is omitted), recover
     /// the registered real value behind every FF1 fake the engine
@@ -141,6 +155,15 @@ pub enum Command {
         /// EOF. Same explicit-only rationale as `scrub`'s FILE.
         #[arg(value_name = "FILE")]
         file: Option<PathBuf>,
+        /// Optional AEAD-encrypted session file (must match the one
+        /// used by an earlier `scrub --session`). Recovers PII /
+        /// Card / Formatless fakes in addition to FF1 fakes, and
+        /// unlinks the file on success (spec A6 design 2:
+        /// "restore --session consumes the file and wipes it").
+        /// A missing session file is fatal - the flag never
+        /// silently degrades to stateless restore.
+        #[arg(long, value_name = "PATH")]
+        session: Option<PathBuf>,
     },
 }
 
@@ -241,79 +264,95 @@ mod tests {
         );
     }
 
-    // ----- LOAD-BEARING: scrub/restore have only the optional FILE -----
+    // ----- LOAD-BEARING: scrub/restore accept only FILE, --vault, and --session -----
     //
     // These pins are the structural enforcement of invariant 1
     // ("restore is explicit-only, never inferred") at the parser
     // layer. Each subcommand must accept ONLY:
-    //   - the optional FILE positional (the user's explicit input scope), and
-    //   - the global --vault flag (a path, not a secret value).
+    //   - the optional FILE positional (the user's explicit input scope),
+    //   - the global `--vault` flag (a path, not a secret value), and
+    //   - the chunk-21 `--session` flag (a path to the AEAD session file).
     //
     // No `--watch`, `--monitor`, `--clipboard`, `--from-env`,
-    // `--auto`, `--background`, etc. The test asserts the actual arg
-    // set so that a drift fails CI with a clear list of the new args.
+    // `--auto`, `--background`, etc. The test asserts the actual
+    // arg SET so a drift fails CI with a clear list of the new args
+    // (rather than just a count mismatch that would be ambiguous when
+    // chunk 21 legitimately added the `session` arg).
     #[test]
-    fn scrub_subcommand_has_only_optional_file_and_global_vault() {
+    fn scrub_subcommand_has_only_optional_file_and_session_flag() {
         let cmd = Cli::command();
         let scrub = cmd
             .find_subcommand("scrub")
             .expect("the scrub subcommand must exist");
         // Exclude clap-auto `--help` and the global `--vault` from
         // the assertion - we are pinning OUR scrub-specific surface.
-        let our_args: Vec<&clap::Arg> = scrub
+        let mut ids: Vec<&str> = scrub
             .get_arguments()
             .filter(|a| a.get_id() != "help" && a.get_id() != "vault")
+            .map(|a| a.get_id().as_str())
             .collect();
+        ids.sort();
         assert_eq!(
-            our_args.len(),
-            1,
-            "scrub must declare exactly ONE argument beyond --help/--vault \
-             (the optional FILE positional). Found: {:?}",
-            our_args
-                .iter()
-                .map(|a| a.get_id().as_str())
-                .collect::<Vec<_>>()
+            ids,
+            vec!["file", "session"],
+            "scrub must accept exactly {{FILE positional, --session PATH flag}} \
+             beyond --help/--vault. Any new named flag risks becoming a \
+             non-explicit input trigger (--watch / --clipboard / --from-env) \
+             and must land through this pin's ledger."
         );
-        let only = our_args[0];
+
+        // FILE is positional; --session is a named flag.
+        let file = scrub
+            .get_arguments()
+            .find(|a| a.get_id() == "file")
+            .expect("file arg present");
+        assert!(file.is_positional(), "FILE must be positional");
+        let session = scrub
+            .get_arguments()
+            .find(|a| a.get_id() == "session")
+            .expect("session arg present");
         assert!(
-            only.is_positional(),
-            "scrub's only argument must be positional (FILE); a named flag \
-             could become a non-explicit input trigger (--watch / --clipboard / \
-             --from-env), which violates the explicit-only invariant. Got: {:?}",
-            only.get_id().as_str()
+            !session.is_positional(),
+            "--session must be a named flag, not a positional"
         );
-        assert_eq!(only.get_id().as_str(), "file");
+        assert_eq!(session.get_long(), Some("session"));
     }
 
     #[test]
-    fn restore_subcommand_has_only_optional_file_and_global_vault() {
+    fn restore_subcommand_has_only_optional_file_and_session_flag() {
         let cmd = Cli::command();
         let restore = cmd
             .find_subcommand("restore")
             .expect("the restore subcommand must exist");
-        let our_args: Vec<&clap::Arg> = restore
+        let mut ids: Vec<&str> = restore
             .get_arguments()
             .filter(|a| a.get_id() != "help" && a.get_id() != "vault")
+            .map(|a| a.get_id().as_str())
             .collect();
+        ids.sort();
         assert_eq!(
-            our_args.len(),
-            1,
-            "restore must declare exactly ONE argument beyond --help/--vault \
-             (the optional FILE positional). A `--clipboard`, `--watch`, or \
-             `--auto` flag here would break the explicit-only invariant - \
-             restore must only ever operate on bytes the user explicitly \
-             passed in. Found: {:?}",
-            our_args
-                .iter()
-                .map(|a| a.get_id().as_str())
-                .collect::<Vec<_>>()
+            ids,
+            vec!["file", "session"],
+            "restore must accept exactly {{FILE positional, --session PATH flag}} \
+             beyond --help/--vault. A `--clipboard`, `--watch`, or `--auto` flag \
+             here would break the explicit-only invariant - restore must only \
+             ever operate on bytes the user explicitly passed in."
         );
-        let only = our_args[0];
+
+        let file = restore
+            .get_arguments()
+            .find(|a| a.get_id() == "file")
+            .expect("file arg present");
+        assert!(file.is_positional(), "FILE must be positional");
+        let session = restore
+            .get_arguments()
+            .find(|a| a.get_id() == "session")
+            .expect("session arg present");
         assert!(
-            only.is_positional(),
-            "restore's only argument must be positional (FILE)."
+            !session.is_positional(),
+            "--session must be a named flag, not a positional"
         );
-        assert_eq!(only.get_id().as_str(), "file");
+        assert_eq!(session.get_long(), Some("session"));
     }
 
     // ----- clap self-test: the derived parser is internally consistent -----

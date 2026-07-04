@@ -458,6 +458,40 @@ impl Vault {
             .map(entry_to_registered)
             .collect()
     }
+
+    /// Load and AEAD-decrypt a `--session` file at `path` under this
+    /// vault's key. Returns `Ok(None)` if the file does not exist (a
+    /// signal, not an error - the CLI decides whether "not present"
+    /// is fatal per the operation). See
+    /// `crate::session_file::load_session_file` for the format and
+    /// error surface.
+    ///
+    /// The vault key stays inside this `Vault` - only a copy of its
+    /// bytes is passed to the session helper, wrapped in `Zeroizing`
+    /// so it wipes when the copy leaves scope.
+    pub fn load_session_file(
+        &self,
+        io: &dyn VaultIo,
+        path: &Path,
+        now_epoch: u64,
+    ) -> Result<Option<crate::session_file::SessionContents>, crate::session_file::SessionFileError>
+    {
+        let key = Zeroizing::new(self.vault_key.expose_secret().to_vec());
+        crate::session_file::load_session_file(io, path, &key, now_epoch)
+    }
+
+    /// Serialize `contents`, AEAD-encrypt under a subkey derived
+    /// from this vault's key, and atomically write to `path` with
+    /// mode `SESSION_FILE_MODE`.
+    pub fn save_session_file(
+        &self,
+        io: &dyn VaultIo,
+        path: &Path,
+        contents: &crate::session_file::SessionContents,
+    ) -> Result<(), crate::session_file::SessionFileError> {
+        let key = Zeroizing::new(self.vault_key.expose_secret().to_vec());
+        crate::session_file::save_session_file(io, path, &key, contents)
+    }
 }
 
 // ---------- helpers: AEAD encrypt / decrypt ----------

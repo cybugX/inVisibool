@@ -10,6 +10,7 @@ pub mod detection;
 pub mod engine;
 pub mod idempotence;
 pub mod keychain;
+pub mod session_file;
 pub mod tokenizer;
 pub mod vault;
 

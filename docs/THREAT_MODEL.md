@@ -582,6 +582,144 @@ user out of every secret they've ever registered.
 
 ---
 
+### 15. The `--session` file: fake -> real pairs at rest on the user's disk (M1)
+
+**Threat.** The chunk-21 `scrub --session PATH` and
+`restore --session PATH` commands persist a `{fake -> real}` map on
+disk between the two commands so PII / Card / Formatless
+registered values are restorable across two separate CLI
+invocations. The map holds real secret bytes; the file itself is a
+new at-rest artifact under the user's control, sitting alongside
+the vault file with the same overall class of risk. Concrete
+failure modes: (a) an attacker who acquires the file but not the
+OS keychain reads structured metadata (schema version, timestamps,
+approximate entry count via ciphertext length) and MUST NOT be
+able to recover any pair; (b) an attacker with BOTH the file and
+the keychain recovers every pair - the same trust boundary as the
+vault; (c) a same-user attacker on a shared system reads the file
+via filesystem access if permissions are lax; (d) accidental
+type-confusion with the vault file under a shared vault key would
+let one artifact class silently succeed at the AEAD layer when
+handed to the other's code path.
+
+**Mitigation.**
+
+- **AEAD: XChaCha20-Poly1305,** identical primitive and nonce
+  discipline as the vault (row 14). Fresh 24-byte random nonce
+  per encrypt via the OS CSPRNG under the same panic contract.
+- **AEAD key derivation: HKDF-SHA-256** with a **distinct**
+  `info` label `"invisibool-session-aead-v1"` (vault uses
+  `"invisibool-vault-aead-v1"`). Same vault key sources both
+  derivations, but the derived subkeys are independent under
+  HKDF's domain-separation guarantee - a compromise or rotation
+  of one does not follow the other.
+- **AAD = MAGIC + version + reserved (first 20 bytes)** with the
+  **distinct** MAGIC `b"INVISIBOOL_SESSN"` (vault uses
+  `b"INVISIBOOL_VAULT"`). Distinct MAGIC is checked BEFORE the
+  AEAD attempt, so pointing `--session` at a vault file (or a
+  vault file at `--session`) returns a typed
+  `SessionFileError::NotASessionFile` rather than a subtle AEAD
+  or JSON-schema failure. Under a shared vault key that check is
+  load-bearing: without it, a vault file passed to
+  `restore --session` would decrypt cleanly at the AEAD layer
+  and only fail at JSON-schema parse, an ambiguous surface where
+  the behavior mistake would be silent.
+- **Atomic write: write-temp + fsync + rename + fsync-parent,**
+  reusing `VaultIo::write_atomic` verbatim. At any crash point
+  the on-disk state is one of two stable states; a half-written
+  session file is unreachable by construction.
+- **File permissions: `0o600` set at create time on Unix,**
+  matching the vault-file discipline exactly. On Windows the
+  file inherits the parent dir's DACL; chunk 25 / 26 / 27 will
+  refine the platform-specific privacy hooks together with the
+  vault-side counterparts.
+- **Mandatory short TTL, enforced at load with NO silent reset.**
+  Every session file carries `created_at` and `expires_at =
+  created_at + 30 min`. Loading a file with `expires_at <=
+  now_epoch` returns `SessionFileError::Expired { expired_at }`;
+  the CLI refuses the operation rather than silently regenerating
+  the file. A REPEAT `scrub --session PATH` merges new entries
+  into the existing file while **preserving the original
+  `expires_at`** - repeated scrubbing cannot extend the session's
+  lifetime past its first-write deadline.
+- **Wipe on restore: `remove_file` (unlink), not shred.** After
+  a successful `restore --session PATH`, the CLI unlinks the file
+  per spec A6 design 2 ("restore --session consumes the file and
+  wipes it"). Overwrite-based shredding is deliberately **not**
+  attempted - modern filesystem journaling and SSD wear-levelling
+  make it largely ineffective, and claiming shred we cannot
+  deliver would be theater. The real confidentiality mitigation
+  is AEAD ciphertext under a keychain-custody key; unlink alone
+  is honest about that.
+- **Visible destruction on wipe.** If entries in the file were
+  NOT present in the restore input (the reply text the user is
+  processing), those mappings are destroyed by the wipe. The
+  CLI's stderr summary reports the count explicitly ("N session
+  entries not present in this input, discarded with the session
+  file.") so the destruction is never silent - matches the
+  spec's "unrestorability is never silent" discipline for the
+  scrub-side notices.
+- **No hand-rolled crypto.** Same RustCrypto crates as row 14
+  (`chacha20poly1305`, `hkdf`, `sha2`); the session-file module
+  only composes them with a distinct AAD and HKDF info label.
+
+**Residual.**
+
+- **Attacker class 1 (file only, no keychain):** sees the file's
+  size (bounds the entry count), the plaintext header
+  (`INVISIBOOL_SESSN` + version + reserved), and the AAD's
+  authenticated identifier. Cannot recover any `{fake, real}`
+  pair. Same shape as the vault-file attacker in row 14.
+- **Attacker class 2 (file AND keychain):** full plaintext. Every
+  `{fake, real}` pair falls to a single vault-key derivation.
+  Trust boundary is identical to the vault file's; the session
+  file adds no new exposure class beyond what the vault already
+  has for the same registered values. `rotate-key` (M4a) rotates
+  BOTH the vault and any live session file's decryptability at
+  once - a session file written under the old key cannot be read
+  under the new one.
+- **Attacker class 3 (same-user on the machine):** `0o600` blocks
+  cross-user read; the trust boundary is the OS user account, the
+  same boundary the OS keychain already sits behind. Same-user
+  is not a threat we can close at the filesystem layer.
+- **Post-unlink ciphertext blocks may survive on the physical
+  medium.** Journaling filesystems, SSD wear-levelling, and copy-
+  on-write layouts routinely retain freed blocks until the
+  filesystem reuses them. `remove_file` releases the inode; the
+  underlying block content is not overwritten by us. The
+  confidentiality guarantee for those surviving blocks is the
+  AEAD ciphertext they hold, not physical erasure. Any user
+  concerned about medium-level residuals should encrypt the
+  filesystem itself (LUKS / FileVault / BitLocker); we cannot
+  offer a stronger guarantee at the application layer without
+  claiming shred we cannot deliver.
+- **`serde_json` read-path intermediate + `SessionContents.entries[i].real`
+  heap copies.** The session file's decrypt path parses the
+  plaintext into a `SessionContents { entries: Vec<SessionPair
+  { fake: String, real: String }> }`. Both `String`s land in
+  serde_json intermediate allocations that are not
+  Zeroizing-wrapped, then get imported into the `SessionMap`
+  which does wipe its own copies on eviction. Sibling residual to
+  the chunk-18 vault read path (row 14's `serde_json`
+  intermediate bullet), the chunk-19 write-path
+  `VaultEntry.value`, and the chunk-20 engine output buffers.
+  Full closure (a Zeroizing-direct deserializer plus
+  `SessionPair.real: Zeroizing<String>`) is deferred to M4a
+  vault hardening together with the other siblings so the whole
+  class closes at once rather than half-closing across three
+  milestones. Phrased as "deferred to M4a" (a plan), not "will
+  be fixed" (a promise).
+- **Fake -> real linkability within one session file's lifetime.**
+  The engine's session-mapped fakes are deterministic in the real
+  value under one session (per-submission stability). An attacker
+  who has BOTH the session file AND the LLM prompt / reply text
+  can correlate scrubbed messages by fake reuse. Same shape as
+  the PII-fake-linkability row 10 for the live `watch` daemon;
+  the session file exposes the same property at rest for its
+  30-minute lifetime.
+
+---
+
 ## Deferred rows (introduced at later milestones)
 
 These items are part of the documented threat model but the code
