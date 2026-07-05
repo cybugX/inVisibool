@@ -5,14 +5,13 @@
 //! ## Chunk-21 scope
 //!
 //! This module is the on-disk artifact for the terminal-mode session
-//! store. The spec's canonical description is at
-//! `invisibool-spec.md` A6 fallback design 2 (line 300): "an
-//! AEAD-encrypted file under a private app dir, keyed from the
-//! vault/keychain, with a mandatory short TTL and auto-expiry, wiped
-//! on restore or on expiry". Chunk 21 delivers the AEAD file itself
-//! and the merge / expiry / wipe semantics. The `session ls|clear`
-//! subcommand and the daemon-side `watch` idle lock live in later
-//! milestones (M4a full CLI; M1 chunks 22-27 for the daemon path).
+//! store. The design is an AEAD-encrypted file under a private app
+//! dir, keyed from the vault/keychain, with a mandatory short TTL
+//! and auto-expiry, wiped on restore or on expiry. Chunk 21 delivers
+//! the AEAD file itself and the merge / expiry / wipe semantics. The
+//! `session ls|clear` subcommand and the daemon-side `watch` idle
+//! lock live in later milestones (M4a full CLI; M1 chunks 22-27 for
+//! the daemon path).
 //!
 //! ## Cryptographic design
 //!
@@ -131,8 +130,8 @@ const AEAD_KEY_LEN: usize = 32;
 /// independent under HKDF's domain-separation guarantee.
 const SESSION_HKDF_INFO_AEAD: &[u8] = b"invisibool-session-aead-v1";
 
-/// Default session TTL, per spec A6 fallback design 2 ("e.g. 30 min,
-/// configurable"). Chunk 21 ships this as a fixed constant;
+/// Default session TTL: 30 minutes, mandatory-short per the
+/// session-file design. Chunk 21 ships this as a fixed constant;
 /// configurability lands with the full CLI in M4a.
 pub const SESSION_TTL_SECS: u64 = 30 * 60;
 
@@ -436,8 +435,8 @@ pub fn save_session_file(
 }
 
 /// Best-effort unlink of the session file. Called by
-/// `restore --session PATH` after a successful restore, per spec A6
-/// design 2 ("restore --session consumes the file and wipes it").
+/// `restore --session PATH` after a successful restore: the design
+/// requires `restore --session` to consume the file and wipe it.
 ///
 /// UNLINK, NOT SHRED. Modern filesystems' journaling + SSD
 /// wear-levelling make overwrite-based shredding largely ineffective;

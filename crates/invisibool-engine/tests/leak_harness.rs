@@ -435,7 +435,7 @@ fn formatless_long_body_mac_fake_does_not_leak() {
             canary.len(),
             "fake length must match real length"
         );
-        assert_ne!(fake, canary, "fake equals canary — no scrubbing happened");
+        assert_ne!(fake, canary, "fake equals canary, no scrubbing happened");
         assert!(
             invisibool_engine::tokenizer::mac::verify(&mac_key, fake, &Alphabet::BASE62),
             "[formatless-long #{round}] emitted MAC-fake does not verify under the session MAC key",

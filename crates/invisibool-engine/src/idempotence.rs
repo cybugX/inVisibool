@@ -443,7 +443,7 @@ mod tests {
             assert_eq!(
                 decision,
                 IdempotenceDecision::NoOp(NoOpReason::Ff1DecryptedToRegistered),
-                "scrub(scrub({input})) was not idempotent — got {decision:?}"
+                "scrub(scrub({input})) was not idempotent, got {decision:?}"
             );
         }
     }
