@@ -30,7 +30,7 @@
 //! tweak weakens FF1). If it fails, the entry is stored as
 //! [`VaultEntryKind::SessionMapped`] with kind
 //! [`SessionFakeKind::Formatless`] AND the CLI prints the
-//! A15-row-2 non-restorability disclosure to stderr.
+//! Formatless non-restorability disclosure to stderr.
 //!
 //! This is a deliberate M1 simplification - alphabet detection
 //! (Base32 / Hex / etc.) and prefix inference (`sk-`, `ghp_`,
@@ -48,6 +48,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
+use invisibool_control::path::default_control_paths;
+use invisibool_control::transport::{dial_once, DEFAULT_TIMEOUT};
+use invisibool_control::wire::{Request, Response, StatusData};
+use invisibool_control::ControlError;
 use invisibool_engine::engine::ScrubNotice;
 use invisibool_engine::keychain::KeychainBackend;
 use invisibool_engine::session_file::{
@@ -135,9 +139,8 @@ pub fn register<K: KeychainBackend, W: Write, E: Write>(
                  Consequence: scrub will replace it with a MAC-tagged random \
                  fake. The original value is NOT restorable in terminal mode \
                  without --session; the running `invisibool watch` daemon \
-                 keeps it in its session map until restart. This is the \
-                 chunk-19 / A15-row-2 disclosure; the registration is still \
-                 recorded."
+                 keeps it in its session map until restart. The registration \
+                 is still recorded."
             )
             .ok();
             VaultEntryKind::SessionMapped {
@@ -198,9 +201,9 @@ fn read_input(source: Option<&Path>) -> io::Result<Zeroizing<String>> {
 }
 
 /// Render a single `ScrubNotice` into a one-line stderr message. The
-/// SessionMappedUnrestorable line is the spec line 39 / A15-row-2
-/// disclosure ("scrub ends by printing exactly which values will not
-/// be restorable"). The two `Redacted*` lines surface engine-side
+/// SessionMappedUnrestorable line is the mandatory never-silent
+/// disclosure: scrub ends by printing exactly which values will not
+/// be restorable. The two `Redacted*` lines surface engine-side
 /// fail-closed events that the user needs to know about (the value
 /// was removed, not faked).
 fn format_notice(n: &ScrubNotice) -> String {
@@ -208,15 +211,16 @@ fn format_notice(n: &ScrubNotice) -> String {
         ScrubNotice::SessionMappedUnrestorable { label, kind } => {
             format!(
                 "notice: '{label}' ({kind:?}) was scrubbed into a session-mapped fake; \
-                 it will NOT restore in terminal mode without --session. The chunk-19 \
+                 it will NOT restore in terminal mode without --session. The \
                  register-time disclosure said this would happen."
             )
         }
         ScrubNotice::RedactedFormatless { label } => {
             format!(
                 "warning: '{label}' was redacted (placeholder substituted, original removed); \
-                 chunk-20 cannot restore it. Engine-side Formatless fake generator is the \
-                 chunk-19+ follow-on."
+                 terminal restore cannot recover it. A Formatless fake generator that \
+                 would let scrub emit a MAC-tagged fake instead of redacting is a \
+                 planned follow-on."
             )
         }
         ScrubNotice::RedactedInternalFailure { label, reason } => {
@@ -376,8 +380,8 @@ pub fn scrub<K: KeychainBackend, W: Write, E: Write>(
 ///     BEFORE the engine call (the difference between total and
 ///     present is the number of mappings destroyed by the wipe).
 ///   - Calls [`Engine::restore_with_session`].
-///   - Unlinks the session file (spec A6 design 2:
-///     "restore --session consumes the file and wipes it").
+///   - Unlinks the session file: the session-file design requires
+///     `restore --session` to consume the file and wipe it.
 ///     Unlink, not shred - the confidentiality mitigation is AEAD +
 ///     keychain custody per THREAT_MODEL row 15.
 ///   - Stderr summary reports both the restored count AND the count
@@ -519,6 +523,83 @@ fn format_kind(k: &EntryKindSummary) -> String {
     }
 }
 
+/// `invisibool status`. Ask the running daemon over the control
+/// channel and print what it says. On no-daemon-running, print the
+/// specified fallback and exit 0.
+///
+/// Never dials TCP. `socket_override` is the CLI --socket flag
+/// value; when None the CLI resolves via
+/// `default_control_paths()`.
+pub fn status<W: Write, E: Write>(
+    socket_override: Option<&Path>,
+    out: &mut W,
+    err: &mut E,
+) -> Result<i32, CommandError> {
+    let socket_path = match socket_override {
+        Some(p) => p.to_path_buf(),
+        None => match default_control_paths() {
+            Ok(paths) => paths.socket,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return Ok(3);
+            }
+        },
+    };
+
+    match dial_once(&socket_path, Request::Status, DEFAULT_TIMEOUT) {
+        Ok(Response::Ok(v)) => {
+            match serde_json::from_value::<StatusData>(v.clone()) {
+                Ok(data) => {
+                    // Daemon-present response: single-line summary,
+                    // then a blank line then the version so scripts
+                    // parsing stdout can split on it if they want.
+                    writeln!(
+                        out,
+                        "watch is running: pid={} uptime={}s version={}",
+                        data.pid, data.uptime_secs, data.version
+                    )
+                    .ok();
+                    Ok(0)
+                }
+                Err(_) => {
+                    // Well-framed but malformed data: report typed
+                    // error to stderr and exit 3.
+                    let _ = writeln!(
+                        err,
+                        "error: daemon returned a status response with an unexpected shape: {v}"
+                    );
+                    Ok(3)
+                }
+            }
+        }
+        Ok(Response::Err(payload)) => {
+            let _ = writeln!(
+                err,
+                "error: daemon returned error ({}): {}",
+                payload.kind.as_str(),
+                payload.message
+            );
+            Ok(3)
+        }
+        Err(ControlError::Io(io_err))
+            if matches!(
+                io_err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            // Daemon-absent fallback. This path prints to stdout,
+            // not stderr, and exits 0: it is a documented normal
+            // outcome, not an error.
+            writeln!(out, "watch is not running").ok();
+            Ok(0)
+        }
+        Err(e) => {
+            let _ = writeln!(err, "error: control channel: {e}");
+            Ok(3)
+        }
+    }
+}
+
 /// Errors a command function may return. `main` maps these to exit
 /// codes (typically 3 for any variant; the per-variant breakout
 /// lets future surfaces - `watch`, `scrub` - distinguish them).
@@ -622,6 +703,9 @@ pub fn run(
                 &mut stdout,
                 &mut stderr,
             )
+        }
+        crate::cli::args::Command::Status { socket } => {
+            status(socket.as_deref(), &mut stdout, &mut stderr)
         }
     };
     match result {

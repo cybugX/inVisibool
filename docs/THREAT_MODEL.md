@@ -643,9 +643,9 @@ handed to the other's code path.
   `expires_at`** - repeated scrubbing cannot extend the session's
   lifetime past its first-write deadline.
 - **Wipe on restore: `remove_file` (unlink), not shred.** After
-  a successful `restore --session PATH`, the CLI unlinks the file
-  per spec A6 design 2 ("restore --session consumes the file and
-  wipes it"). Overwrite-based shredding is deliberately **not**
+  a successful `restore --session PATH`, the CLI unlinks the file:
+  the session-file design requires `restore --session` to consume
+  the file and wipe it. Overwrite-based shredding is deliberately **not**
   attempted - modern filesystem journaling and SSD wear-levelling
   make it largely ineffective, and claiming shred we cannot
   deliver would be theater. The real confidentiality mitigation
@@ -720,6 +720,193 @@ handed to the other's code path.
 
 ---
 
+### 16. The daemon control channel: a same-user IPC surface commanding real-secret writes (M1)
+
+**Landed at M1 chunk 22.** The `invisibool status` subcommand talks
+to a running `watch` daemon over the control channel: an owner-only
+Unix domain socket at `$XDG_RUNTIME_DIR/invisibool/ctl.sock`
+(falling back to `$XDG_STATE_HOME/invisibool/ctl.sock` then
+`$HOME/.local/state/invisibool/ctl.sock`), mode `0600` under a
+`0700` parent, peer-UID verified via `SO_PEERCRED`, carrying a
+length-prefixed JSON protocol with a 64 KiB max frame size.
+
+The full command set (`pause`, `resume`, `restore-clipboard`,
+`session-ls`, `session-clear`) is pinned on the wire this chunk;
+only `status` has a real handler yet - the other five stub with
+`error.kind = "not-implemented"` and land their handler bodies with
+the `watch` daemon in later chunks. The threat model applies now
+because the transport is real, the socket exists on disk when the
+daemon runs, and the trust boundary is decided before those
+handlers appear.
+
+**Threat.** Any process running as the daemon's user can dial the
+socket and issue commands. In the deferred-handler world that means
+`pause` (blinding the daemon while the attacker copies a real secret
+in the clear), `restore-clipboard` (writing real secrets to the
+clipboard, where the attacker reads them), or `session-clear`
+(destroying the session map so a legitimate restore fails). Attacker
+classes for the socket surface:
+
+- **Class 1 - accidental same-user process.** A cron job, a
+  legitimately-installed program, or a background helper that
+  reaches the socket by mistake.
+- **Class 2 - same-user malware with code execution.** An attacker
+  who has arbitrary code running as the daemon's user.
+- **Class 3 - a same-user sandboxed application** (a Flatpak, Snap,
+  Firejail, or containerised app) that shares access to the socket
+  path.
+
+**Mitigation.**
+
+- **Transport.** Never TCP, not even loopback. Localhost TCP is
+  reachable by every local user and by many sandboxed apps; a UDS
+  protected by filesystem permissions is not.
+- **Filesystem permissions.** Socket `0600`, parent directory
+  `0700`. `transport::UnixServer::bind` verifies the actual mode of
+  both after `bind()` and refuses to start on any divergence rather
+  than silently `chmod`-ing (a user who deliberately tightened
+  permissions is not walked over).
+- **Peer verification.** After `accept()`, `SO_PEERCRED` returns
+  the peer's effective UID; a mismatch against the daemon's own
+  `geteuid()` closes the connection. The behavioural test uses an
+  injectable `PeerVerifier` trait so the reject path is exercised
+  without a real foreign-UID process (CI runs single-user); a real
+  foreign-UID connection reject on a production kernel is
+  documented as verified manually at release, not gated by CI.
+- **Windows.** Not shipped in chunk 22; the design pins a named
+  pipe `\\.\pipe\invisibool-<user-SID>` with an owner-only DACL
+  and, as **defence-in-depth beyond the named-pipe DACL alone**, the
+  `FILE_FLAG_FIRST_PIPE_INSTANCE` flag on `CreateNamedPipeW` so a
+  same-user attacker cannot pre-squat the pipe name and MITM a
+  legitimate client. The DACL restricting the pipe to the current
+  user is the primary defence; `FIRST_PIPE_INSTANCE` closes a
+  same-user pre-squat race that a bare DACL check would not catch.
+- **No secrets on the wire, structurally.** Every response body
+  schema is pinned in `crates/invisibool-control/src/wire.rs`; none
+  has a field capable of carrying a real value. `SessionEntry` on
+  the wire has `fake` and `entity_kind` and explicitly no `real`
+  field; `restore-clipboard` triggers the daemon to write the
+  clipboard itself, so the real value's lifetime stays inside the
+  daemon's memory and never crosses the channel. A pin test asserts
+  the wire bytes of `SessionLsData` never contain the string
+  `"real"`; a runtime canary leak-harness test drives every wire
+  command and asserts a per-run canary string never appears in the
+  recorded bytes in either direction. A future PR that tried to
+  smuggle a real value into a response would need to modify the
+  wire types and would fire both tests.
+- **Bounded resources.** 4-byte big-endian length prefix with a
+  hard 64 KiB per-frame cap enforced before body allocation
+  (defence against a same-user attacker sending a `u32::MAX`-declared
+  frame that would otherwise force a 4 GiB allocation). 5-second
+  read/write timeout per connection.
+- **Concurrent-connection cap: DECLARED, NOT YET ENFORCED (review item 2).**
+  `CONCURRENT_CONN_CAP = 8` is a design pin in
+  `crates/invisibool-control/src/transport.rs`, and the kernel
+  listen backlog is set to 16, so the chunk-22 transport bounds
+  what the kernel will queue. But **there is no per-accept
+  semaphore in chunk 22** - the transport crate ships the primitives
+  (`UnixServer::accept()`) and the real `watch` daemon's serve loop
+  will enforce the in-flight cap when it lands. Do not read the
+  presence of `CONCURRENT_CONN_CAP` in the source as an active
+  runtime bound today. This mitigation is deferred to the daemon
+  serve-loop chunk.
+- **Lifecycle hygiene.** Single-instance `flock(LOCK_EX | LOCK_NB)`
+  on `ctl.lock` refuses a second daemon and does not auto-unlink the
+  lock file (`flock` is released by the OS on process death
+  regardless, so a lingering file is harmless). Stale-socket cleanup
+  probes with `connect()`; on `ConnectionRefused` or `NotFound` the
+  path is unlinked; anything else (`PermissionDenied`) is refused
+  rather than blindly unlinked.
+- **Never-silent daemon-absent fallback.** With no daemon running,
+  `invisibool status` prints "watch is not running" to stdout and
+  exits 0 - a documented normal outcome, not an error. The wire is
+  never contacted with anything other than the daemon.
+
+**Residual.**
+
+- **Attacker class 2 (same-user code execution).** By construction,
+  a same-user attacker has full access to command the daemon: they
+  can dial the socket, pass peer verification (their UID matches
+  the daemon's), and issue any command. This is the *same trust
+  boundary the OS keychain already exposes* - same-user malware
+  typically reads the keychain anyway. The channel adds no new
+  exposure class. When the deferred handlers land, an IPC-triggered
+  `restore-clipboard` will still carry platform privacy hints,
+  content-checked auto-clear, and a visible indication - so a user
+  whose machine has a class-2 attacker sees the visible-indication
+  fire and can respond by locking the keychain, killing the daemon,
+  or restoring their session from backup. Documented; not eliminated.
+
+- **Attacker class 1 (accidental same-user process).** Bounded by
+  three things: (a) the visible indication that will fire on every
+  restore under the deferred handler, (b) content-checked
+  auto-clear after 60 s, and (c) the practical fact that no
+  accidental process is going to happen to structure a well-formed
+  length-prefixed JSON `restore-clipboard` command by mistake -
+  the protocol is narrow enough that "some cron job triggered it"
+  is not a realistic failure mode.
+
+- **Attacker class 3 (a same-user sandboxed app).** The peer
+  verification catches **only the UID-remapped variant** - a user
+  namespace that presents a different `SO_PEERCRED` UID than the
+  daemon's is rejected. It does **not** catch the common case: a
+  same-user Flatpak or Snap runs as the *same* UID as the daemon
+  by default, so `SO_PEERCRED` returns a match and the connection
+  is accepted. What actually protects against class 3 is the
+  sandbox's own mount isolation of `$XDG_RUNTIME_DIR` - and that
+  is **not ours to provide**. If a sandbox is configured with a
+  private XDG runtime dir, the daemon socket is simply not
+  reachable from inside the sandbox; if it is broken or
+  deliberately shares the host runtime dir, the sandboxed app
+  collapses into attacker class 2 for our purposes, and inherits
+  class 2's residual. We do not claim a defence the mechanism
+  cannot provide.
+
+- **TOCTOU stale-socket squat.** The stale-socket cleanup path
+  runs `connect()` (probe) → `unlink()` → `bind()`; a same-user
+  attacker who wins a microsecond-window race between the
+  successful probe and our `unlink()` could squat the socket path.
+  The squatter is same-user by construction, already inside the
+  class-2 trust boundary, and could simply dial the real daemon
+  instead - so mitigating the squat would be motion without
+  security. `FILE_FLAG_FIRST_PIPE_INSTANCE` closes the equivalent
+  race on Windows structurally; the Linux race is documented
+  rather than mitigated.
+
+- **Daemon PID exposure on `status`.** The `status` response body
+  includes `pid`, `uptime_secs`, and `version`. `pid` is a minor
+  local info-leak within the same-user trust boundary (a same-user
+  process could always enumerate via `/proc` or `ps`) and is
+  accepted for its operational value: it lets the user
+  `kill $(status | ...)` a stuck daemon without having to `pgrep`
+  first.
+
+- **Behavioral gates do not verify real-kernel foreign-UID
+  rejection.** The `RejectVerifier` in `crates/invisibool-control/
+  src/peer.rs` exercises the reject path against the *code*; a
+  real-world foreign-UID connection reject on a production kernel
+  requires an integration test running as a foreign UID which
+  single-user CI runners cannot cheaply provide. The reject path
+  is documented as verified manually at release.
+
+- **Error messages do not echo offending payloads.** `bad-json`
+  and `frame-too-large` responses carry only the error kind and a
+  size or format description, never a byte range of the offending
+  payload back to the peer. The typed error kind is enough
+  diagnostics for a legitimate CLI client and cutting off
+  arbitrary-byte echo removes an info-leak surface for a hostile
+  same-user peer probing the daemon.
+
+- **Reject log verbosity is deliberately minimal.** On a peer-UID
+  mismatch, the daemon logs `control-channel: rejected connection
+  from uid=<n> (expected uid=<m>)` and nothing else - no PID, no
+  `comm`, no timestamp beyond what the daemon's normal log prefix
+  carries. The reject peer is by definition foreign; echoing its
+  PID or process name to daemon stderr would be a subtle info leak
+  about local processes the daemon shouldn't be broadcasting.
+
+---
+
 ## Deferred rows (introduced at later milestones)
 
 These items are part of the documented threat model but the code
@@ -734,7 +921,6 @@ rewritten when each milestone lands.
 | Clipboard history / cloud sync | M1 | Windows clipboard history, macOS Universal Clipboard, and cross-device cloud clipboards may capture the *pre-scrub original* before `watch` writes the scrubbed text - Invisibool cannot retract it. Mitigations: platform clipboard-privacy hints (`ExcludeClipboardContentFromMonitorProcessing` etc.), content-checked 60 s auto-clear of the restore slot, a first-run platform-specific warning. Hint-ignoring clipboard managers defeat the privacy-hint mitigation; this is admitted in the M1 docs. |
 | Polling race | M1 | On platforms without clipboard event APIs, `watch` polls; a clipboard write between polls can be observed by the next reader before scrub runs. The worst-case polling window is published in the M1 README. |
 | Silent corruption from non-verbatim echo | M1 | `watch` must never write a partially-restored value - the daemon refuses to write back a value it could not restore completely, surfacing the failure instead. |
-| Control-channel same-user attack | M1 | The daemon control socket (Unix domain socket / Windows named pipe) is peer-UID/DACL-checked and never TCP. Same-user code execution already has every privilege the daemon does, so the control channel is not a new exposure class. |
 | `forget` orphans old fakes | M4a | Default `forget` moves to an encrypted retired set (idempotence still recognises the old fake; `restore` reports "forgotten - not restored"). `forget --purge` deletes fully and warns that old fakes become unrecognisable, so re-scrubbing old text may double-fake them. |
 
 ---

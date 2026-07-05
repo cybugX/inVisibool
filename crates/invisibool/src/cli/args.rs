@@ -1,6 +1,6 @@
 //! `clap` derive definitions for `invisibool`.
 //!
-//! Surface (M1 chunks 19-20):
+//! Surface (M1 chunks 19-22):
 //!
 //! ```text
 //! invisibool [--vault <PATH>] <SUBCOMMAND>
@@ -10,6 +10,7 @@
 //!   forget <LABEL>       Remove an entry. Exits 4 if the label does not exist.
 //!   scrub  [FILE]        Read input from FILE or stdin, write scrubbed text to stdout.
 //!   restore [FILE]       Read input from FILE or stdin, write restored text to stdout.
+//!   status               Ask the running `watch` daemon (if any) for its status.
 //! ```
 //!
 //! ## `scrub` / `restore` shape (chunks 20 and 21)
@@ -158,12 +159,29 @@ pub enum Command {
         /// Optional AEAD-encrypted session file (must match the one
         /// used by an earlier `scrub --session`). Recovers PII /
         /// Card / Formatless fakes in addition to FF1 fakes, and
-        /// unlinks the file on success (spec A6 design 2:
-        /// "restore --session consumes the file and wipes it").
-        /// A missing session file is fatal - the flag never
-        /// silently degrades to stateless restore.
+        /// unlinks the file on success: the session-file design
+        /// requires `restore --session` to consume the file and
+        /// wipe it. A missing session file is fatal - the flag
+        /// never silently degrades to stateless restore.
         #[arg(long, value_name = "PATH")]
         session: Option<PathBuf>,
+    },
+    /// Ask the running `watch` daemon for its status via the
+    /// control channel (owner-only Unix domain socket, never TCP).
+    /// If no daemon is running, prints "watch is not running" to
+    /// stdout and exits 0 - the documented daemon-absent fallback.
+    /// Never dials TCP, not even loopback: the transport is a UDS
+    /// or a Windows named pipe, protected by filesystem permissions
+    /// and peer credentials.
+    Status {
+        /// Override the default control-socket path. If unset, the
+        /// CLI uses `$XDG_RUNTIME_DIR/invisibool/ctl.sock` (falling
+        /// back to `$XDG_STATE_HOME/invisibool/ctl.sock` and then
+        /// `$HOME/.local/state/invisibool/ctl.sock`). Only used by
+        /// tests and by users on unusual filesystems; never accepts
+        /// a network address.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -353,6 +371,46 @@ mod tests {
             "--session must be a named flag, not a positional"
         );
         assert_eq!(session.get_long(), Some("session"));
+    }
+
+    // ----- LOAD-BEARING: status accepts only --socket -----
+    //
+    // The status subcommand talks to the control channel. Its only
+    // legitimate override is a socket path. If anyone adds a
+    // `--host`, `--port`, `--tcp`, `--remote`, or any other flag
+    // that would let the transport be anything other than a local
+    // UDS, they have just re-opened the localhost-TCP hole the
+    // channel design explicitly forbids. This pin fails
+    // structurally on any such addition.
+    #[test]
+    fn status_subcommand_has_only_socket_flag() {
+        let cmd = Cli::command();
+        let status = cmd
+            .find_subcommand("status")
+            .expect("the status subcommand must exist");
+        let mut ids: Vec<&str> = status
+            .get_arguments()
+            .filter(|a| a.get_id() != "help" && a.get_id() != "vault")
+            .map(|a| a.get_id().as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["socket"],
+            "status must accept exactly {{--socket PATH}} beyond --help/--vault. \
+             Adding a --host, --port, --tcp, or --remote flag would re-open \
+             the localhost-TCP hole the control channel forbids; the \
+             control channel is a UDS, never TCP."
+        );
+        let socket = status
+            .get_arguments()
+            .find(|a| a.get_id() == "socket")
+            .expect("socket arg present");
+        assert!(
+            !socket.is_positional(),
+            "--socket must be a named flag, not a positional"
+        );
+        assert_eq!(socket.get_long(), Some("socket"));
     }
 
     // ----- clap self-test: the derived parser is internally consistent -----

@@ -1,0 +1,61 @@
+[package]
+name = "invisibool-control"
+description = "Invisibool daemon control channel: owner-only Unix domain socket transport, peer-UID verification, length-prefixed JSON wire format, single-instance lock, stale-socket cleanup. Linux-only landing in M1 chunk 22; macOS/Windows backends land in later chunks behind the same trait boundary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# libc is a direct dep of this crate ONLY. The peer-verification path
+# needs SO_PEERCRED (Linux) / getpeereid (macOS) syscalls that require
+# unsafe FFI. This crate carries `#![deny(unsafe_code)]` at the root
+# with narrowly-scoped `#[allow(unsafe_code)]` on the specific unsafe
+# blocks in peer.rs and lifecycle.rs. The engine and vault crates
+# remain `#![forbid(unsafe_code)]` (workspace lint) - the unsafe
+# surface is auditable in one crate.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Test-only daemon binary.
+#
+# Declared as [[bin]] so the integration tests locate it via
+# env!("CARGO_BIN_EXE_daemon-stub") without racy target/debug/deps
+# scanning; the alternatives (an [[example]] with a hand-constructed
+# target-dir path, or a required-features feature that cargo test
+# does not auto-enable) are more fragile than the ship-time hazard
+# this posture creates. Reference: chunk-22 review-item 3.
+#
+# HAZARD CLASS: this [[bin]] is built on every `cargo build` (not
+# just `cargo test`), and if `invisibool-control` is ever published
+# to crates.io then `cargo install invisibool-control` would
+# install daemon-stub alongside the library. Today no crate is
+# published (the CLI ships as `invisibool`, and `invisibool-control`
+# is a path-only workspace member); consumers who install
+# `invisibool` from crates.io do NOT get daemon-stub because it
+# lives in a different package. This posture is safe TODAY.
+#
+# PRE-PUBLISH CHECKLIST (before any `cargo publish -p
+# invisibool-control` command is run):
+#   1. Gate this [[bin]] behind `required-features = ["_test-daemon"]`
+#      and make the feature non-default, OR
+#   2. Move the binary source out of this crate into a separate
+#      unpublished helper crate, OR
+#   3. Delete daemon-stub entirely if the real daemon has replaced
+#      the need for it by that milestone.
+# Do not publish invisibool-control until one of those three lands.
+#
+# The real peer verifier (`UnixPeerVerifier`) is what the binary
+# binds with in the accept case, so a stray production use of
+# daemon-stub still enforces the peer-UID check; the RejectAll
+# variant lives inside daemon-stub.rs and is never exposed as a
+# reusable library symbol.
+[[bin]]
+name = "daemon-stub"
+path = "tests/bin/daemon-stub.rs"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/invisibool-engine",
     "crates/invisibool",
+    "crates/invisibool-control",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ authors = ["The Invisibool Authors"]
 
 [workspace.dependencies]
 invisibool-engine = { path = "crates/invisibool-engine", version = "=0.0.0" }
+invisibool-control = { path = "crates/invisibool-control", version = "=0.0.0" }
 
 # M0b engine dependencies.
 #

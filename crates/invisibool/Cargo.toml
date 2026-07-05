@@ -14,9 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 invisibool-engine = { workspace = true }
+invisibool-control = { workspace = true }
 clap = { workspace = true }
 rpassword = { workspace = true }
 zeroize = { workspace = true }
+# serde_json only for parsing the status response's typed `data`
+# payload; already a workspace dep for the engine.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
