@@ -45,15 +45,27 @@ ARG GITLEAKS_VERSION=8.30.1
 ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
 
 # --- OS deps -----------------------------------------------------------------
-# Minimal: ca-certificates for HTTPS downloads, curl to fetch tool tarballs,
-# git for cargo-deny's advisory-DB clone. No clipboard or keychain native
-# libraries here - the test backends are in-memory; nightly OS-native smoke
-# tests run on real OS runners, not in this container.
+# ca-certificates for HTTPS downloads, curl to fetch tool tarballs, git for
+# cargo-deny's advisory-DB clone.
+#
+# libdbus-1-dev + pkg-config: build-time requirement of the keyring crate's
+# Linux backend (Secret Service via libdbus-sys / dbus-secret-service). The
+# runtime keychain tests use the in-memory backend and never touch DBus,
+# but the workspace still LINKS the OS-keychain module on Linux, and
+# `cargo build -p invisibool` fails without these two packages present.
+# Nightly OS-native smoke tests exercise the real Secret Service on the
+# real OS runners; this container hosts the workspace build and its test
+# suite only. The general lesson: when a new system-library requirement
+# lands, every build environment (CI runner, this dev container, README
+# instructions) must be updated in the same chunk, and the dev container
+# must be rebuilt and exercised at least once before the milestone gate.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
+        libdbus-1-dev \
+        pkg-config \
  && rm -rf /var/lib/apt/lists/*
 
 # --- cargo-deny --------------------------------------------------------------
