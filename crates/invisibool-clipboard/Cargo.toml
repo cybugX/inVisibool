@@ -1,0 +1,15 @@
+[package]
+name = "invisibool-clipboard"
+description = "Invisibool clipboard trait, privacy hints, in-memory test backend, and display-server detection. Platform backends (Windows / macOS / X11) land in later chunks behind the same trait; Wayland is refused at startup because Wayland's core protocol does not expose the private-clipboard-format hints or the cross-application change-listener the daemon needs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Every text value read from the clipboard is potentially a real
+# secret; the trait boundary is born wipe-on-drop so a real secret
+# read via read_text() does not persist beyond the caller's use.
+zeroize = { workspace = true }

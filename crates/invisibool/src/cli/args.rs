@@ -1,6 +1,6 @@
 //! `clap` derive definitions for `invisibool`.
 //!
-//! Surface (M1 chunks 19-22):
+//! Surface (M1 chunks 19-23):
 //!
 //! ```text
 //! invisibool [--vault <PATH>] <SUBCOMMAND>
@@ -11,6 +11,9 @@
 //!   scrub  [FILE]        Read input from FILE or stdin, write scrubbed text to stdout.
 //!   restore [FILE]       Read input from FILE or stdin, write restored text to stdout.
 //!   status               Ask the running `watch` daemon (if any) for its status.
+//!   watch                Run the clipboard-watch daemon. Refused on Wayland
+//!                        and Headless; not yet implemented on X11 / native
+//!                        desktop in this release.
 //! ```
 //!
 //! ## `scrub` / `restore` shape (chunks 20 and 21)
@@ -183,6 +186,22 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
     },
+    /// Run the clipboard-watch daemon.
+    ///
+    /// Wayland and Headless environments are refused with a clear
+    /// message and exit code 6; the terminal `scrub` / `restore`
+    /// paths still work on both. Supported display servers exit
+    /// with code 7 in this release because the daemon backends
+    /// land in later work; the trait boundary and Wayland refusal
+    /// are what this landing delivers.
+    ///
+    /// Takes no arguments today. The `pause`, `resume`, and
+    /// `status` subcommands that the design calls for command the
+    /// running daemon over the control channel and land alongside
+    /// the daemon itself; keeping `watch` argument-free today means
+    /// their eventual addition does not have to reshape this
+    /// subcommand.
+    Watch,
 }
 
 #[cfg(test)]
@@ -411,6 +430,37 @@ mod tests {
             "--socket must be a named flag, not a positional"
         );
         assert_eq!(socket.get_long(), Some("socket"));
+    }
+
+    // ----- LOAD-BEARING: watch accepts NO arguments -----
+    //
+    // The watch subcommand is argument-free today. The pause /
+    // resume / status commands the design calls for command the
+    // running daemon over the control channel and land as
+    // separate top-level subcommands alongside the daemon body.
+    // If anyone adds a positional or flag to `watch` here, the
+    // eventual daemon subcommands will have to reshape this
+    // subcommand's surface - a churn we forestall by pinning the
+    // arg-free shape now.
+    #[test]
+    fn watch_subcommand_takes_no_arguments() {
+        let cmd = Cli::command();
+        let watch = cmd
+            .find_subcommand("watch")
+            .expect("the watch subcommand must exist");
+        let our_args: Vec<&clap::Arg> = watch
+            .get_arguments()
+            .filter(|a| a.get_id() != "help" && a.get_id() != "vault")
+            .collect();
+        assert!(
+            our_args.is_empty(),
+            "watch must take no arguments beyond --help and the global \
+             --vault flag. Found args: {:?}",
+            our_args
+                .iter()
+                .map(|a| a.get_id().as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     // ----- clap self-test: the derived parser is internally consistent -----

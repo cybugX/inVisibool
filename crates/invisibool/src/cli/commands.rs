@@ -8,7 +8,7 @@
 //! Formatless disclosure are exercised in unit tests without
 //! running the binary as a subprocess.
 //!
-//! ## Exit codes (chunk 19)
+//! ## Exit codes
 //!
 //! | Code | Meaning |
 //! |------|---------|
@@ -17,6 +17,8 @@
 //! | 3    | Vault I/O, keychain, or path-resolution error |
 //! | 4    | `forget` on a label that does not exist |
 //! | 5    | `register` on a label that is already registered |
+//! | 6    | `watch` refused by platform (Wayland or Headless) - documented, not a bug |
+//! | 7    | `watch` supported platform but not yet implemented in this release; **temporary**, disappears with the daemon backends |
 //!
 //! ## M1 chunk-19 dispatch policy (the kind a freshly-registered entry gets)
 //!
@@ -48,6 +50,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
+use invisibool_clipboard::{detect_display_server, DisplayServer};
 use invisibool_control::path::default_control_paths;
 use invisibool_control::transport::{dial_once, DEFAULT_TIMEOUT};
 use invisibool_control::wire::{Request, Response, StatusData};
@@ -600,6 +603,87 @@ pub fn status<W: Write, E: Write>(
     }
 }
 
+/// `invisibool watch`. Detects the display server and either
+/// refuses (Wayland / Headless, exit 6) or reports not-yet-
+/// implemented (X11 / native desktop, exit 7). The daemon body
+/// and its clipboard backends land in later work; the trait
+/// boundary and Wayland refusal are what this landing delivers.
+///
+/// Runtime output strings here do not carry chunk numbers,
+/// milestone IDs, or private ledger anchors: this text ships to
+/// real users on stdout / stderr.
+pub fn watch<W: Write, E: Write>(_out: &mut W, err: &mut E) -> Result<i32, CommandError> {
+    match detect_display_server() {
+        DisplayServer::Wayland => {
+            let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+            let display_hint = if wayland_display.is_empty() {
+                String::from("(detected via XDG_SESSION_TYPE=wayland)")
+            } else {
+                format!("(detected via WAYLAND_DISPLAY={wayland_display})")
+            };
+            let _ = writeln!(
+                err,
+                "error: `invisibool watch` is not supported on Wayland {display_hint}.
+
+Why: Wayland's core protocol does not expose the private-clipboard-format \
+hints that the daemon's own clipboard writes need, so those writes - above \
+all restored real values - would be captured by clipboard history and \
+cloud-sync tools. Compositor extensions such as ext-data-control-v1 exist \
+on some compositors but are not supported in this version. Wayland's core \
+protocol also does not let a background process subscribe to clipboard \
+changes made by other applications, so the daemon cannot detect a copy in \
+time to scrub it. Continuing would silently give you weaker protection \
+than the terminal path.
+
+Alternatives that still work:
+  invisibool scrub <FILE>              read a file, print scrubbed text
+  invisibool scrub                     read stdin, print scrubbed text
+  invisibool restore <FILE>            read a file, print restored text
+  invisibool scrub --session <PATH>    keep PII/card values restorable
+                                       across two separate invocations
+
+Documented limitation; not fixable inside Invisibool alone. See \
+docs/THREAT_MODEL.md row 17."
+            );
+            Ok(6)
+        }
+        DisplayServer::Headless => {
+            let _ = writeln!(
+                err,
+                "error: `invisibool watch` requires a display server (no DISPLAY or \
+WAYLAND_DISPLAY environment variable was set).
+
+If you are on a headless server, in a container without display forwarding, \
+or in a systemd unit that inherits no session, the daemon cannot function. \
+Use terminal scrub / restore instead:
+
+  invisibool scrub <FILE>              read a file, print scrubbed text
+  invisibool scrub                     read stdin, print scrubbed text
+  invisibool restore <FILE>            read a file, print restored text
+  invisibool scrub --session <PATH>    keep PII/card values restorable
+                                       across two separate invocations"
+            );
+            Ok(6)
+        }
+        DisplayServer::X11 | DisplayServer::NativeDesktop => {
+            let _ = writeln!(
+                err,
+                "error: `invisibool watch` is not yet implemented on this platform.
+
+The daemon and its clipboard backends land in a future release. Until then, \
+use terminal scrub / restore:
+
+  invisibool scrub <FILE>              read a file, print scrubbed text
+  invisibool scrub                     read stdin, print scrubbed text
+  invisibool restore <FILE>            read a file, print restored text
+  invisibool scrub --session <PATH>    keep PII/card values restorable
+                                       across two separate invocations"
+            );
+            Ok(7)
+        }
+    }
+}
+
 /// Errors a command function may return. `main` maps these to exit
 /// codes (typically 3 for any variant; the per-variant breakout
 /// lets future surfaces - `watch`, `scrub` - distinguish them).
@@ -707,6 +791,7 @@ pub fn run(
         crate::cli::args::Command::Status { socket } => {
             status(socket.as_deref(), &mut stdout, &mut stderr)
         }
+        crate::cli::args::Command::Watch => watch(&mut stdout, &mut stderr),
     };
     match result {
         Ok(code) => code,
@@ -2520,6 +2605,152 @@ mod tests {
                 Err(CommandError::Session(SessionFileError::AeadDecrypt))
             ),
             "cross-vault use must fail typed AeadDecrypt: got {res:?}"
+        );
+    }
+
+    // ----- watch subcommand: three env-var-driven paths -----
+    //
+    // Each test forces `detect_display_server` into a specific
+    // outcome by manipulating WAYLAND_DISPLAY / XDG_SESSION_TYPE /
+    // DISPLAY inside a mutex-guarded critical section. Env-var
+    // mutation is process-global on Unix; the mutex serialises the
+    // three watch tests so they do not race each other, and each
+    // test restores the previous values on drop.
+
+    use std::sync::Mutex as StdMutex;
+
+    static WATCH_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn set(&mut self, key: &'static str, value: Option<&str>) {
+            let prev = std::env::var_os(key);
+            self.saved.push((key, prev));
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, prev) in self.saved.drain(..).rev() {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn watch_on_wayland_refuses_with_exit_6_and_specific_message() {
+        let _lock = WATCH_ENV_LOCK.lock().unwrap();
+        let mut guard = EnvGuard { saved: Vec::new() };
+        guard.set("WAYLAND_DISPLAY", Some("wayland-0"));
+        guard.set("XDG_SESSION_TYPE", Some("wayland"));
+        guard.set("DISPLAY", None);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = watch(&mut out, &mut err).unwrap();
+        assert_eq!(code, 6, "Wayland refusal must exit with code 6");
+
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("not supported on Wayland"),
+            "message must name Wayland specifically: {stderr}"
+        );
+        assert!(
+            stderr.contains("WAYLAND_DISPLAY=wayland-0"),
+            "message must include the detected env-var value: {stderr}"
+        );
+        assert!(
+            stderr.contains("ext-data-control-v1"),
+            "message must name the compositor extension that would fill the gap: {stderr}"
+        );
+        assert!(
+            stderr.contains("clipboard history and cloud-sync tools"),
+            "message must state the true mechanism: without hints, daemon writes leak to \
+             clipboard history / cloud sync: {stderr}"
+        );
+        assert!(
+            stderr.contains("invisibool scrub"),
+            "message must point at the terminal alternatives: {stderr}"
+        );
+        assert!(
+            stderr.contains("docs/THREAT_MODEL.md row 17"),
+            "message must reference the threat-model row: {stderr}"
+        );
+        assert!(
+            out.is_empty(),
+            "watch refusal must not print to stdout, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn watch_headless_refuses_with_exit_6_and_specific_message() {
+        let _lock = WATCH_ENV_LOCK.lock().unwrap();
+        let mut guard = EnvGuard { saved: Vec::new() };
+        guard.set("WAYLAND_DISPLAY", None);
+        guard.set("XDG_SESSION_TYPE", None);
+        guard.set("DISPLAY", None);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = watch(&mut out, &mut err).unwrap();
+        assert_eq!(code, 6, "Headless refusal must exit with code 6");
+
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("requires a display server"),
+            "message must state the requirement: {stderr}"
+        );
+        assert!(
+            stderr.contains("headless server")
+                || stderr.contains("container")
+                || stderr.contains("systemd unit"),
+            "message must name at least one likely context: {stderr}"
+        );
+        assert!(
+            stderr.contains("invisibool scrub"),
+            "message must point at the terminal alternatives: {stderr}"
+        );
+        assert!(
+            out.is_empty(),
+            "watch refusal must not print to stdout, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn watch_on_x11_reports_not_yet_implemented_with_exit_7() {
+        let _lock = WATCH_ENV_LOCK.lock().unwrap();
+        let mut guard = EnvGuard { saved: Vec::new() };
+        guard.set("WAYLAND_DISPLAY", None);
+        guard.set("XDG_SESSION_TYPE", Some("x11"));
+        guard.set("DISPLAY", Some(":0"));
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = watch(&mut out, &mut err).unwrap();
+        assert_eq!(code, 7, "not-yet-implemented on X11 must exit with code 7");
+
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("not yet implemented"),
+            "message must state that watch is not implemented yet: {stderr}"
+        );
+        assert!(
+            stderr.contains("invisibool scrub"),
+            "message must point at the terminal alternatives: {stderr}"
+        );
+        assert!(
+            out.is_empty(),
+            "watch not-yet-implemented must not print to stdout, got: {out:?}"
         );
     }
 }

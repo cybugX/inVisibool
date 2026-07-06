@@ -907,6 +907,110 @@ classes for the socket surface:
 
 ---
 
+### 17. Wayland users get no automatic clipboard protection (M1)
+
+**Landed at M1 chunk 23.** The `invisibool watch` subcommand
+detects the display server at startup via environment variables
+(`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, `DISPLAY`). On Wayland
+sessions it refuses to start with a clear message, points at the
+terminal `scrub` / `restore` alternatives, and exits with code 6.
+On sessions with no display server (SSH into a headless host,
+container without display forwarding, systemd unit) it refuses
+similarly.
+
+**Threat.** Wayland users cannot use the headline clipboard-scrub
+protection. The refusal is explicit and points at terminal
+alternatives, but a user who does not read the message (an
+automation script that swallows stderr, a novice who ignores the
+error) has no runtime backstop against copying a real secret
+straight into an LLM chat interface. The terminal path is a
+different workflow: it requires the user to route text through
+`invisibool scrub` before copying, and to run `invisibool restore`
+on any reply that comes back with fakes in it. It is materially
+more manual than the automatic clipboard daemon; it is not a drop-
+in replacement.
+
+**Why Wayland is refused, and not silently degraded.**
+
+- **Privacy-hint mechanism.** The daemon's own clipboard writes
+  (scrub replacements, restored real values, session-map entries)
+  need the private-clipboard-format hints that Windows'
+  `ExcludeClipboardContentFromMonitorProcessing`,
+  `CanIncludeInClipboardHistory=0`, `CanUploadToCloudClipboard=0`
+  custom formats and macOS's `org.nspasteboard.ConcealedType`
+  provide. Without those hints, clipboard history and cloud-sync
+  tools capture the daemon's writes - including restored real
+  values - and the daemon becomes a leak channel it was designed
+  to close. Wayland's core protocol does not expose an equivalent.
+  Note: this is NOT about the pre-scrub original the user copied;
+  that copy is captured the instant the user hits Ctrl-C, before
+  any daemon rewrite, hints or not. The "Clipboard history / cloud
+  sync" row in the Deferred rows table (below the live rows) covers
+  the pre-scrub capture. Row 17 is about our OWN writes.
+- **Cross-application change listener.** The daemon needs to see
+  when another application writes the clipboard so it can scrub
+  before the user pastes. Wayland's core protocol does not expose
+  this to background processes. Compositor extensions such as
+  `ext-data-control-v1` and its predecessors (`wlr-data-control`,
+  `zwlr-data-control-v1`) implement the missing piece on some
+  compositors, but they are not supported in this version.
+
+**Mitigation.**
+
+- Clear refusal message with explicit terminal-workflow
+  instructions; the message states the true mechanism (without
+  privacy hints, daemon writes leak into clipboard history and
+  cloud-sync tools), names the compositor extension that would
+  fill the gap, and lists the four alternative commands verbatim.
+- Distinct exit code (6) for programmatic detection: a shell
+  wrapper can catch this and route the user to the terminal
+  workflow.
+- Documentation prominently states the Wayland limitation; the
+  refusal message references this row explicitly so a curious
+  user has a next hop.
+- Terminal `scrub` / `restore` remain fully functional on
+  Wayland, X11, macOS, Windows, and headless. They never touch
+  the clipboard and never consult the display-server detector.
+
+**Residual.**
+
+- **Wayland users have no daemon-mode protection today.** Not
+  fixable inside Invisibool alone: it needs Wayland compositor
+  extensions widely deployed, and the terminal workflow is
+  materially less ergonomic. Compositor-extension support is a
+  future work item; timeline is compositor-dependent, not ours.
+- **Users who don't read the refusal** (scripts that swallow
+  stderr, novices who ignore errors) get no protection. The
+  distinct exit code lets a wrapper detect this, but a naive
+  wrapper does not.
+- **XWayland conformance dependency.** The `WAYLAND_DISPLAY`-wins-
+  over-`DISPLAY` rule catches XWayland clients. A Wayland
+  compositor that fails to set `WAYLAND_DISPLAY` for XWayland
+  clients would let the daemon believe it is on X11 and behave
+  incorrectly. Documented as a compositor-conformance dependency;
+  not fixable inside Invisibool.
+- **Env-var spoof.** A same-user attacker who sets
+  `WAYLAND_DISPLAY=""` before launching `invisibool watch` could
+  force the daemon to attempt to start on what is really Wayland.
+  Same-user is inside the declared trust boundary (row 16); the
+  failure mode is "daemon starts, fails at the first clipboard
+  call, exits with a platform error" rather than a data leak.
+  Detection via `logind` (which requires `libsystemd`) would be
+  more robust but is not portable across non-systemd Linux. The
+  env-var-only approach is what this landing ships.
+- **Self-write suppression is probabilistic, not certain.** When
+  the daemon is built out in later chunks, its `ClipboardEvent`s
+  will carry `matches_our_write: Option<WriteToken>` set by the
+  backend when it can determine the event resulted from one of
+  our own writes. The determination is content-plus-token based;
+  a same-user program that writes identical bytes at the same
+  moment could be misclassified as one of our writes and get
+  silently ignored. The bound is "with high probability our
+  write", not "certainly our write", and callers must not treat
+  the flag as security-critical.
+
+---
+
 ## Deferred rows (introduced at later milestones)
 
 These items are part of the documented threat model but the code
@@ -918,7 +1022,7 @@ rewritten when each milestone lands.
 | Row | Introduced at | Summary |
 |---|---|---|
 | Idle lock | M1 | When the `watch` daemon idles past its threshold, AEAD-encrypts the in-memory session map under the vault key and drops the plaintext map + key + automaton. Restorability survives idle (one keychain fetch on wake re-derives, decrypts, rebuilds). Ciphertext-at-rest in memory while idle. |
-| Clipboard history / cloud sync | M1 | Windows clipboard history, macOS Universal Clipboard, and cross-device cloud clipboards may capture the *pre-scrub original* before `watch` writes the scrubbed text - Invisibool cannot retract it. Mitigations: platform clipboard-privacy hints (`ExcludeClipboardContentFromMonitorProcessing` etc.), content-checked 60 s auto-clear of the restore slot, a first-run platform-specific warning. Hint-ignoring clipboard managers defeat the privacy-hint mitigation; this is admitted in the M1 docs. |
+| Clipboard history / cloud sync | M1 | Windows clipboard history, macOS Universal Clipboard, and cross-device cloud clipboards may capture the *pre-scrub original* the instant the user copies (before any daemon rewrite can land) AND may capture the daemon's own writes - notably restored real values - if the writes do not carry the platform-specific privacy hints. Mitigations: platform clipboard-privacy hints on every daemon write (`ExcludeClipboardContentFromMonitorProcessing` etc. on Windows; `org.nspasteboard.ConcealedType` on macOS; no protocol equivalent on Wayland which is refused per row 17), content-checked 60 s auto-clear of the restore slot, a first-run platform-specific warning. Hint-ignoring clipboard managers defeat the privacy-hint mitigation; this is admitted in the M1 docs. |
 | Polling race | M1 | On platforms without clipboard event APIs, `watch` polls; a clipboard write between polls can be observed by the next reader before scrub runs. The worst-case polling window is published in the M1 README. |
 | Silent corruption from non-verbatim echo | M1 | `watch` must never write a partially-restored value - the daemon refuses to write back a value it could not restore completely, surfacing the failure instead. |
 | `forget` orphans old fakes | M4a | Default `forget` moves to an encrypted retired set (idempotence still recognises the old fake; `restore` reports "forgotten - not restored"). `forget --purge` deletes fully and warns that old fakes become unrecognisable, so re-scrubbing old text may double-fake them. |

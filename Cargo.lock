@@ -558,10 +558,18 @@ name = "invisibool"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "invisibool-clipboard",
  "invisibool-control",
  "invisibool-engine",
  "rpassword",
  "serde_json",
+ "zeroize",
+]
+
+[[package]]
+name = "invisibool-clipboard"
+version = "0.0.0"
+dependencies = [
  "zeroize",
 ]
 
