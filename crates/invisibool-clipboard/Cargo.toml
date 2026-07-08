@@ -13,3 +13,8 @@ authors.workspace = true
 # secret; the trait boundary is born wipe-on-drop so a real secret
 # read via read_text() does not persist beyond the caller's use.
 zeroize = { workspace = true }
+
+# X11 backend. Linux-only; the target-gated dep block means Windows
+# and macOS builds do not pull x11rb.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { workspace = true }

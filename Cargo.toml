@@ -143,6 +143,14 @@ clap = { version = "4", default-features = false, features = ["std", "help", "us
 # toggle, then read until newline.
 rpassword = "7"
 criterion = "0.8"
+# X11 clipboard backend for the invisibool-clipboard crate (Linux).
+# Pure-Rust X11 protocol bindings; speaks the X11 wire protocol over a
+# Unix domain socket - no libX11 / libxcb / libXfixes needed at build
+# or run time. `xfixes` feature enables selection-change notifications;
+# default features are turned off because we do not use Randr, Present,
+# Xinerama, or the other extensions the crate ships. License MIT OR
+# Apache-2.0 across the transitive tree (verified at chunk-24 design).
+x11rb = { version = "0.13", default-features = false, features = ["xfixes"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -630,9 +630,10 @@ handed to the other's code path.
   session file is unreachable by construction.
 - **File permissions: `0o600` set at create time on Unix,**
   matching the vault-file discipline exactly. On Windows the
-  file inherits the parent dir's DACL; chunk 25 / 26 / 27 will
-  refine the platform-specific privacy hooks together with the
-  vault-side counterparts.
+  file inherits the parent dir's DACL; the Windows clipboard-
+  backend chunk and the daemon serve-loop chunk will refine the
+  platform-specific privacy hooks together with the vault-side
+  counterparts.
 - **Mandatory short TTL, enforced at load with NO silent reset.**
   Every session file carries `created_at` and `expires_at =
   created_at + 30 min`. Loading a file with `expires_at <=
@@ -998,16 +999,119 @@ in replacement.
   Detection via `logind` (which requires `libsystemd`) would be
   more robust but is not portable across non-systemd Linux. The
   env-var-only approach is what this landing ships.
-- **Self-write suppression is probabilistic, not certain.** When
-  the daemon is built out in later chunks, its `ClipboardEvent`s
-  will carry `matches_our_write: Option<WriteToken>` set by the
-  backend when it can determine the event resulted from one of
-  our own writes. The determination is content-plus-token based;
-  a same-user program that writes identical bytes at the same
-  moment could be misclassified as one of our writes and get
-  silently ignored. The bound is "with high probability our
-  write", not "certainly our write", and callers must not treat
-  the flag as security-critical.
+- **Self-write suppression varies by backend, and X11 is the
+  strongest.** The `ClipboardEvent::matches_our_write` field is
+  set by each platform backend when it can identify an event as
+  resulting from one of our own writes. On X11 (chunk 24), the
+  XFixes `SelectionNotify` event includes the OWNER window ID -
+  comparing that to our own hidden InputOnly window gives us an
+  exact "was this our write?" answer. On the deferred Windows and
+  macOS backends, no equivalent owner-identity field exists in the
+  platform APIs, so those backends must fall back to a content-
+  plus-token comparison; a same-user program that writes identical
+  bytes at the same moment could be misclassified as one of our
+  writes and get silently ignored. The bound is "exact" on X11
+  and "high probability" on Windows/macOS; callers must not treat
+  the flag as security-critical across all backends. Ironic
+  outcome: the platform with no privacy-hint mechanism (X11) has
+  the strongest self-write suppression, and vice versa.
+
+---
+
+### 18. X11 clipboard has no per-client isolation (M1)
+
+**Landed at M1 chunk 24.** The X11 backend is now shipped; `watch`
+on Linux/X11 exits 7 (daemon body not yet implemented) but the
+clipboard trait is exercised end-to-end via the integration suite.
+This row states the general X11 property first, then names the
+common instance.
+
+**Threat.** The X11 security model provides no isolation between
+same-session clients. Any X client connected to the same X server
+can (a) read the CLIPBOARD selection at any time via a plain
+`ConvertSelection` + `GetProperty` round-trip, and (b) subscribe
+to CLIPBOARD selection-change events via XFixes exactly the way
+`invisibool watch` does. This is not a bug in a particular
+clipboard-manager implementation; it is the design of the X11
+protocol. Every scrub replacement, every restored real value, and
+every session-map entry the daemon writes to CLIPBOARD is
+readable by every other X client on the same $DISPLAY the moment
+it lands.
+
+Clipboard managers (clipmenu, parcellite, GNOME's clipboard, KDE's
+klipper, and many others) are the common instance of this pattern:
+they subscribe to selection changes and grab every clipboard
+write, typically persisting captures to disk so content survives
+the owning app's exit. The persistence turns the same-session
+read into an at-rest disclosure that outlives the daemon.
+
+**Mitigation.**
+
+- The X11 backend passes `PrivacyHints` through but honors none of
+  the four fields at the X protocol level: X11 has no equivalent
+  mechanism. The hints are recorded internally for tests to audit
+  what the daemon INTENDED, so a future protocol addition (or a
+  `ext-data-control-v1` -class Wayland-style extension) can wire
+  them if one ever appears.
+- The first-run clipboard-environment warning (deferred to the
+  daemon chunk) states the X11-clipboard-managers fact in plain
+  language and points at row 18 for details.
+- The over-cap read refusal (`ReadFailed` with plain-language
+  message; never truncation) means huge pastes do not get
+  silently scrubbed-and-rewritten; the fail-closed refusal lets
+  the user notice and decide what to do.
+
+**Residual.**
+
+- Cannot be closed inside Invisibool. Users on X11 who run any
+  clipboard manager (extremely common on modern Linux desktops)
+  have every daemon write captured to disk. Restored real values
+  are as leak-prone via the clipboard manager as they are
+  directly. The general X11 no-isolation property means even
+  users WITHOUT a clipboard manager cannot rely on same-session
+  isolation.
+- The over-cap read path returns a typed `ReadFailed` error but
+  does NOT itself decide what the daemon should do with the huge
+  clipboard content that triggered the refusal. Options are
+  "leave the unscrubbed content and print a loud warning" vs
+  "clear the clipboard and print a loud warning"; the tradeoff is
+  real (the first passes secrets unscrubbed but disclosed; the
+  second destroys the user's legitimate huge copy) and belongs to
+  the daemon chunk's design review, not to the trait.
+
+---
+
+### 19. X11 PRIMARY selection is NOT protected (M1)
+
+**Landed at M1 chunk 24.** The X11 backend watches and answers
+requests on the CLIPBOARD selection only. PRIMARY selection - the
+highlight-to-middle-click-paste convention - is not observed by
+the backend and not scrubbed by the daemon.
+
+**Threat.** X11 has two visible selections: CLIPBOARD (the modern
+explicit-copy target set by Ctrl-C) and PRIMARY (the traditional
+highlight-to-copy target set on every text highlight). Some apps
+- notably terminals - set PRIMARY without any explicit user
+action; every mouse-drag over text updates it. A user who
+highlights a secret in a terminal (which sets PRIMARY) and
+middle-clicks in an LLM chat gets the real secret with no
+scrubbing.
+
+**Mitigation.**
+
+- Documented behavior; users are guided to use Ctrl-C (which sets
+  CLIPBOARD) for anything they want the daemon to scrub. The
+  first-run warning message calls this out explicitly.
+- Watching PRIMARY was rejected because it would trigger scrub
+  events on every mouse highlight - prohibitively noisy and
+  unfriendly to the daemon's session map.
+
+**Residual.**
+
+- PRIMARY writes bypass the daemon entirely. Not fixable without
+  watching PRIMARY. A future feature flag could enable PRIMARY
+  watching for users who want the trade-off, but the default is
+  CLIPBOARD-only.
 
 ---
 

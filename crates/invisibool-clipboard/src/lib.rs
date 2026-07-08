@@ -40,6 +40,11 @@ pub mod display_server;
 pub mod error;
 pub mod hints;
 pub mod in_memory;
+#[cfg(target_os = "linux")]
+pub mod x11;
+
+#[cfg(target_os = "linux")]
+pub use x11::X11Clipboard;
 
 pub use display_server::{detect_display_server, detect_display_server_from, DisplayServer};
 pub use error::ClipboardError;

@@ -53,12 +53,19 @@ ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f24
 # runtime keychain tests use the in-memory backend and never touch DBus,
 # but the workspace still LINKS the OS-keychain module on Linux, and
 # `cargo build -p invisibool` fails without these two packages present.
-# Nightly OS-native smoke tests exercise the real Secret Service on the
-# real OS runners; this container hosts the workspace build and its test
-# suite only. The general lesson: when a new system-library requirement
-# lands, every build environment (CI runner, this dev container, README
-# instructions) must be updated in the same chunk, and the dev container
-# must be rebuilt and exercised at least once before the milestone gate.
+#
+# xvfb + xclip: the X11 clipboard backend's integration tests and the
+# gate demo need a headless X server (Xvfb) and a reference X clipboard
+# tool (xclip) to cross-verify what the backend put on the clipboard.
+# The tests skip cleanly if either binary is missing.
+#
+# Nightly OS-native smoke tests exercise the real Secret Service and
+# real X server on real OS runners; this container hosts the workspace
+# build and its test suite only. The general lesson: when a new system-
+# library requirement lands, every build environment (CI runner, this
+# dev container, README instructions) must be updated in the same chunk,
+# and the dev container must be rebuilt and exercised at least once
+# before the milestone gate.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -66,6 +73,9 @@ RUN apt-get update \
         git \
         libdbus-1-dev \
         pkg-config \
+        xauth \
+        xclip \
+        xvfb \
  && rm -rf /var/lib/apt/lists/*
 
 # --- cargo-deny --------------------------------------------------------------
