@@ -47,7 +47,7 @@ jobs:
     name: cargo fmt --check
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
         with:
           components: rustfmt
@@ -58,7 +58,7 @@ jobs:
     name: cargo check + test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Linux-only build dep: keyring's sync-secret-service backend
@@ -66,7 +66,7 @@ jobs:
       # libdbus-1 via pkg-config. macOS/Windows runners would not need
       # this; this entire workflow targets ubuntu-24.04, so the step
       # is correctly Linux-scoped by virtue of every job's runs-on.
-      - run: sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: sudo apt-get install -y libdbus-1-dev pkg-config xauth xclip xvfb
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace --all-targets
 
@@ -75,13 +75,13 @@ jobs:
     name: cargo clippy -D warnings
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # See check-test job for rationale (keyring/sync-secret-service -> libdbus-sys).
-      - run: sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: sudo apt-get install -y libdbus-1-dev pkg-config xauth xclip xvfb
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # ----- cargo-deny --------------------------------------------------------
@@ -92,7 +92,7 @@ jobs:
       CARGO_DENY_VERSION: 0.19.8
       CARGO_DENY_SHA256: 70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Install pinned cargo-deny
         run: |
           set -euo pipefail
@@ -129,7 +129,7 @@ jobs:
   # workflow change. Treat an empty-result first push as expected, not a
   # mystery success.
   audit:
-    name: "cargo audit (M0a: dep-free, structural)"
+    name: "cargo audit (RustSec advisory scan)"
     runs-on: ubuntu-24.04
     env:
       CARGO_AUDIT_VERSION: 0.22.2
@@ -137,7 +137,7 @@ jobs:
       # asset (see Dockerfile.dev annotation). Re-verify when bumping.
       CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: M0a context
         run: |
           cat <<'EOF'
@@ -171,7 +171,7 @@ jobs:
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           # gitleaks scans git history; the default shallow checkout would
           # only see the most recent commit. fetch-depth: 0 pulls full
@@ -209,11 +209,11 @@ jobs:
     name: leak harness
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # See check-test job for rationale (keyring/sync-secret-service -> libdbus-sys).
-      - run: sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: sudo apt-get install -y libdbus-1-dev pkg-config xauth xclip xvfb
       - run: cargo test -p invisibool-engine --test leak_harness -- --nocapture
 
   # ----- Criterion bench regression ----------------------------------------
@@ -235,11 +235,11 @@ jobs:
     name: bench regression
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # See check-test job for rationale (keyring/sync-secret-service -> libdbus-sys).
-      - run: sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: sudo apt-get install -y libdbus-1-dev pkg-config xauth xclip xvfb
       - name: Run engine scrub benches
         # Short measurement keeps per-PR cost low; the regen job below
         # uses longer measurement when producing a baseline.
@@ -264,11 +264,11 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # See check-test job for rationale (keyring/sync-secret-service -> libdbus-sys).
-      - run: sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: sudo apt-get install -y libdbus-1-dev pkg-config xauth xclip xvfb
       - name: Run engine scrub benches (long measurement for baseline)
         run: cargo bench -p invisibool-engine --bench scrub -- --warm-up-time 5 --measurement-time 15
       - name: Emit new baseline JSON
