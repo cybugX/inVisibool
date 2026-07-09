@@ -122,12 +122,11 @@ jobs:
 
   # ----- cargo-audit -------------------------------------------------------
   #
-  # On the M0a dep-free scaffold this job is STRUCTURAL: cargo-audit fetches
-  # the RustSec advisory DB over the network and then has zero non-workspace
-  # crates to audit, so it exits clean trivially. The CI slot exists now so
-  # M0b/M1 (which bring in real deps) start auditing immediately with no
-  # workflow change. Treat an empty-result first push as expected, not a
-  # mystery success.
+  # RustSec advisory scan against the pinned Cargo.lock. Fetches the
+  # RustSec advisory-db over the network, walks every crate resolved by
+  # the lockfile (workspace + transitive), and fails the job on any
+  # non-ignored advisory hit. The lockfile is committed so cargo-audit
+  # sees exactly the versions the built binary links against.
   audit:
     name: "cargo audit (RustSec advisory scan)"
     runs-on: ubuntu-24.04
@@ -138,19 +137,30 @@ jobs:
       CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-      - name: M0a context
+      - name: Context
         run: |
           cat <<'EOF'
-          cargo audit on the M0a scaffold: the workspace has no third-party
-          dependencies yet, so cargo-audit will fetch the RustSec advisory DB
-          and then find nothing to scan. That clean exit is structural and
-          expected. M0b adds the first real deps (aho-corasick, regex, fpe,
-          aes-gcm, argon2, secrecy, zeroize, ...) and from that point on
-          cargo audit becomes meaningful without any workflow change.
+          What this job does:
+            - Downloads a pinned cargo-audit binary, sha256-verified.
+            - Clones (or updates) the RustSec advisory database over HTTPS.
+            - Walks every crate the committed Cargo.lock resolves, including
+              dev-only edges under `criterion` and friends, and reports any
+              advisory that matches a version we depend on.
+            - Fails the job on any advisory hit. Exceptions are never silent:
+              cargo-audit exceptions go on its own ignore list (`--ignore`
+              flags or `.cargo/audit.toml`), cargo-deny exceptions in
+              deny.toml's `[advisories]` section, and either kind must carry
+              a written rationale.
 
-          Tool is networked (advisory DB clone over HTTPS); the engine and
-          vault crate paths themselves remain network-free per the
-          non-negotiables. cargo-audit only ever runs in CI/dev tooling.
+          The tool is networked because it must fetch the advisory DB. The
+          shipping engine and vault crate paths themselves remain network-
+          free per the non-negotiables; cargo-audit only runs in CI and
+          local dev tooling, never at scrub / restore / register time.
+
+          When an advisory fires: `cargo update -p <crate>` inside the
+          workspace, verify the lockfile diff touches only that crate, and
+          re-push. Never silence a finding without a deliberate exception
+          on the tool that raised it, carrying a written rationale.
           EOF
       - name: Install pinned cargo-audit
         run: |
